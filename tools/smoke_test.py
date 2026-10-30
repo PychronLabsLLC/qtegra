@@ -13,6 +13,7 @@ can read (see tools/list_parameters.py). Unreadable names are reported, not fail
 Exit code is 0 when every check passes, 1 otherwise.
 """
 import argparse
+import json
 import socket
 import sys
 
@@ -54,11 +55,20 @@ def ok_reply(reply):
     return not is_error(reply)
 
 
+def is_description(reply):
+    try:
+        d = json.loads(reply)
+    except ValueError:
+        return False
+    return isinstance(d.get("protocol"), int) and bool(d.get("detectors"))
+
+
 def build_checks(detectors):
     """(command, check, description). Commands here must never change hardware state."""
     checks = [
         ("GetVersion", ok_reply, "version string"),
         ("Help", lambda r: "GetData" in r.split(","), "command list includes GetData"),
+        ("Describe", is_description, "JSON with protocol and detectors"),
         ("Ping", lambda r: r == "OK", "OK"),
         ("#7 Ping", lambda r: r == "#7 OK", "reply tagged with the request id"),
         ("GetData", lambda r: ok_reply(r) or r == "Error: no data", "scan data or no data yet"),
@@ -96,7 +106,7 @@ def check_keepalive(host, port, timeout):
     try:
         with socket.create_connection((host, port), timeout=timeout) as s:
             f = s.makefile("rw", encoding="ascii", newline="\n")
-            f.write("KeepAlive\nPing\n#2 Ping\n")
+            f.write("KeepAlive\rPing\r#2 Ping\r\n")
             f.flush()
             replies = [f.readline().rstrip("\n") for _ in expected]
     except OSError as e:

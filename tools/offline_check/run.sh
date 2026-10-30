@@ -1,10 +1,10 @@
 #!/bin/sh
 # Compile RemoteControlServer.cs against stand-ins for the Thermo types, check that
-# PROTOCOL.md matches the command definitions, and run the tests.
+# PROTOCOL.md and protocol.json match the command definitions, and run the tests.
 # Needs the .NET SDK (dotnet). Does not need Qtegra.
 #
 #   run.sh                     check and test
-#   run.sh --update-protocol   regenerate PROTOCOL.md, then check and test
+#   run.sh --update-protocol   regenerate PROTOCOL.md and protocol.json, then check and test
 set -e
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -40,15 +40,19 @@ echo "compiled"
 
 printf '{"runtimeOptions":{"tfm":"%s","rollForward":"LatestMajor","framework":{"name":"Microsoft.NETCore.App","version":"%s"}}}' \
     "$tfm" "${tfm#net}" > "$build/check.runtimeconfig.json"
-protocol="$root/PROTOCOL.md"
-"$dotnet" "$build/check.dll" --protocol "$here/protocol_header.md" "$build/PROTOCOL.md"
-if [ "$1" = "--update-protocol" ]; then
-    cp "$build/PROTOCOL.md" "$protocol"
-    echo "updated PROTOCOL.md"
-elif ! cmp -s "$build/PROTOCOL.md" "$protocol"; then
-    diff -u "$protocol" "$build/PROTOCOL.md" | head -40 || true
-    echo "PROTOCOL.md is out of date: run tools/offline_check/run.sh --update-protocol"
-    exit 1
+"$dotnet" "$build/check.dll" --protocol "$here/protocol_header.md" "$build/PROTOCOL.md" "$build/protocol.json"
+if command -v python3 >/dev/null; then
+    python3 -m json.tool "$build/protocol.json" > /dev/null
 fi
+for doc in PROTOCOL.md protocol.json; do
+    if [ "$1" = "--update-protocol" ]; then
+        cp "$build/$doc" "$root/$doc"
+        echo "updated $doc"
+    elif ! cmp -s "$build/$doc" "$root/$doc"; then
+        diff -u "$root/$doc" "$build/$doc" | head -40 || true
+        echo "$doc is out of date: run tools/offline_check/run.sh --update-protocol"
+        exit 1
+    fi
+done
 
 "$dotnet" "$build/check.dll"

@@ -23,11 +23,12 @@ static class DispatchTest
 
     static int Main(string[] argv)
     {
-        // --protocol <header.md> <output.md>: write PROTOCOL.md instead of running the tests
-        if (argv.Length == 3 && argv[0] == "--protocol")
+        // --protocol <header.md> <PROTOCOL.md> <protocol.json>: write the docs instead of running the tests
+        if (argv.Length == 4 && argv[0] == "--protocol")
         {
             typeof(RemoteControl).GetMethod("RegisterCommands", Flags).Invoke(null, null);
             File.WriteAllText(argv[2], ProtocolMarkdown(File.ReadAllText(argv[1])));
+            File.WriteAllText(argv[3], Run("Describe commands").Replace(",{\"name\":", ",\n{\"name\":").Replace("[{\"name\":\"GetVersion", "[\n{\"name\":\"GetVersion") + "\n");
             return 0;
         }
 
@@ -45,13 +46,25 @@ static class DispatchTest
                 new IRMSBaseCollectorItem { Identifier = "CUP 1", Mass = 40, Appearance = new Appearance { Label = "H1" } } } };
         t.GetField("Instrument", Flags).SetValue(null, instrument);
         t.GetField("DETECTOR_NAMES", Flags).SetValue(null, Config.HELIX_SFT_DETECTOR_NAMES);
+        t.GetField("INSTRUMENT_NAME", Flags).SetValue(null, "HelixSFT");
         t.GetMethod("RegisterCommands", Flags).Invoke(null, null);
 
         Section("dispatcher");
         Check("GetVersion", Run("GetVersion"), r => r.Length > 0 && !r.StartsWith("Error"));
         Check("Help", Run("Help"), r => r.Contains("GetData") && r.Contains("SetMass") && r.Contains("GetNextData"));
         Check("Ping", Run("Ping"), r => r == "OK");
-        Check("Help SetMass", Run("Help SetMass"), r => r.StartsWith("SetMass <mass>[,<cup>] -> OK | Error."));
+        Check("Help SetMass", Run("Help SetMass"), r => r.StartsWith("SetMass <mass>[,<cup>] -> ok."));
+        Check("Help BlankBeam", Run("Help BlankBeam"), r => r.StartsWith("BlankBeam true|false -> ok."));
+        Check("Describe", Run("Describe"), r => r.StartsWith("{\"protocol\":1,") && r.Contains("\"instrument\":\"HelixSFT\"")
+              && r.Contains("\"transport\":\"udp\"") && r.Contains("\"keepalive\"") && r.Contains("{\"id\":\"CUP 1\",\"name\":\"H1\"}"));
+        Check("Describe nope", Run("Describe nope"), r => r == "Error: unknown section nope");
+        Check("Describe commands: optional argument", Run("Describe commands"),
+              r => r.Contains("{\"name\":\"cup\",\"type\":\"text\",\"optional\":true,\"repeated\":false,\"separator\":\",\"}"));
+        Check("Describe commands: enum", Run("Describe commands"),
+              r => r.Contains("{\"name\":\"state\",\"type\":\"enum\",\"values\":[\"On\",\"Off\"],\"optional\":false,\"repeated\":false,\"separator\":\",\"}"));
+        Check("Describe commands: repeated", Run("Describe commands"),
+              r => r.Contains("{\"name\":\"parameter\",\"type\":\"text\",\"optional\":false,\"repeated\":true,\"separator\":\" \"}"));
+        Check("Describe commands: reply", Run("Describe commands"), r => r.Contains("\"reply\":{\"type\":\"number\",\"unit\":\"kV\"}"));
         Check("Help Nope", Run("Help Nope"), r => r == "Error: unknown command Nope");
         Check("KeepAlive over dispatcher", Run("KeepAlive"), r => r.StartsWith("Error: KeepAlive must be the first"));
         Check("GetParameter Nope Set", Run("GetParameter Nope Set"), r => r == "Error: could not read Nope Set");
@@ -127,6 +140,23 @@ static class DispatchTest
             Check("KeepAlive then Subscribe", reader.ReadLine(), r => r == "4|H1,4.5");
         }
 
+        foreach (var end in new[] { "\r", "\r\n" })
+        {
+            using (var c = Connect())
+            {
+                var s = c.GetStream();
+                var reader = new StreamReader(s, Encoding.ASCII);
+                string label = end == "\r" ? "CR" : "CRLF";
+                Write(s, "KeepAlive" + end);
+                Check("KeepAlive " + label, reader.ReadLine(), r => r == "OK");
+                Write(s, "Ping" + end);
+                Check("KeepAlive " + label + " Ping", reader.ReadLine(), r => r == "OK");
+                Write(s, "#6 Ping" + end + "GetDataN" + end);
+                Check("KeepAlive " + label + " two commands", reader.ReadLine(), r => r == "#6 OK");
+                Check("  ...second", reader.ReadLine(), r => r == "4|H1,4.5");
+            }
+        }
+
         using (var idle = Connect())
         {
             // a silent client must not block anyone else, and is dropped after tcp_read_timeout
@@ -171,7 +201,7 @@ static class DispatchTest
                 section = field("Section");
                 sb.Append("\n## " + section + "\n\n| Command | Arguments | Reply | Description |\n|---|---|---|---|\n");
             }
-            sb.AppendFormat("| `{0}` | {1} | {2} | {3} |\n", field("Name"), Code(field("Args")), Code(field("Returns")),
+            sb.AppendFormat("| `{0}` | {1} | {2} | {3} |\n", field("Name"), Code(field("Usage")), Code(field("Reply")),
                             field("Description").Replace("<", "&lt;").Replace(">", "&gt;").Replace("|", "\\|"));
         }
         return sb.ToString();

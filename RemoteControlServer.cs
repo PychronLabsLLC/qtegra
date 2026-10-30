@@ -584,28 +584,20 @@ class RemoteControl
 	}
 	public static String SetIonCounterState(String name, bool state)
 	{
-		/*if (state)
-		{
-			Logger.Log (LogLevel.UserInfo, "Setting IonCounterState True");
-		}
-		else
-		{
-			Logger.Log (LogLevel.UserInfo, "Setting IonCounterState False");
-		}
+		Logger.Log (LogLevel.UserInfo, String.Format("Setting IonCounterState {0} {1}", name, state));
 
         // Adapted from CSIRORemoteControlServer.cs
-        // activate the CDDs...
-		if (!ActivateCounterCup(true, name))
+		if (!ActivateCounterCup(state, name))
 		{
-		    return String.Format("Could not activate {0}.", name};
+		    return String.Format("Error: could not set {0} active={1}", name, state);
 		}
 		Thread.Sleep(1000); // Wait for a little time for the activation to take effect...
 
-		// Restart the monitor scan, to ensure data is reported for the CDD...
-		if (!RunMonitorScan(get_scan_mass()))
+		// Restart the monitor scan, so data is (or is no longer) reported for the CDD...
+		if (!RunMonitorScan(Instrument.MeasurementInfo.ActualScanMass))
 		{
-			return "Could not restart monitor scan.";
-		}*/
+			return "Error: could not restart monitor scan.";
+		}
 
 	   return "OK";
 	}
@@ -685,6 +677,99 @@ class RemoteControl
 		return "OK";
 	}
 
+	// Adapted from activate_ion_counter / SampleFunctionIncludeScript.cs
+	private static bool ActivateAllCounterCups(bool activate)
+	{
+		try
+		{
+			Instrument.SetCDDActivationMode(new CollectorActivationMode(activate ? DetectorActivateMode.Standby : DetectorActivateMode.Off));
+			IRMSBaseCupConfigurationData activeCupData = Instrument.CupConfigurationDataList.GetActiveCupConfiguration();
+			foreach(IRMSBaseCollectorItem col in activeCupData.CollectorItemList)
+			{
+				if ((col.CollectorType == IRMSBaseCollectorType.CounterCup) && col.Mass.HasValue)
+				{
+					col.Active = activate;
+				}
+			}
+			UpdateCounterCupProtection(activeCupData);
+		}
+		catch (Exception e)
+		{
+			Logger.Log(LogLevel.UserError, String.Format("Could not set counter cups active={0}. {1}", activate, e));
+			return false;
+		}
+		return true;
+	}
+
+	private static bool ActivateCounterCup(bool activate, string name)
+	{
+		try
+		{
+			string id = mGetDetectorIdentifier(name);
+			bool found = false;
+			IRMSBaseCupConfigurationData activeCupData = Instrument.CupConfigurationDataList.GetActiveCupConfiguration();
+			foreach(IRMSBaseCollectorItem col in activeCupData.CollectorItemList)
+			{
+				if ((col.CollectorType == IRMSBaseCollectorType.CounterCup) && col.Mass.HasValue &&
+					(col.Identifier == id || col.Appearance.Label == name))
+				{
+					col.Active = activate;
+					found = true;
+				}
+			}
+			if (!found)
+			{
+				Logger.Log(LogLevel.UserError, String.Format("Counter cup {0} not found in active cup configuration", name));
+				return false;
+			}
+			if (activate)
+			{
+				Instrument.SetCDDActivationMode(new CollectorActivationMode(DetectorActivateMode.Standby));
+			}
+			UpdateCounterCupProtection(activeCupData);
+		}
+		catch (Exception e)
+		{
+			Logger.Log(LogLevel.UserError, String.Format("Could not set {0} active={1}. {2}", name, activate, e));
+			return false;
+		}
+		return true;
+	}
+
+	// Protect all counter cups, then unprotect only the ones that are still active
+	private static void UpdateCounterCupProtection(IRMSBaseCupConfigurationData activeCupData)
+	{
+		List<string> activeCups = new List<string>();
+		foreach(IRMSBaseCollectorItem col in activeCupData.CollectorItemList)
+		{
+			if ((col.CollectorType == IRMSBaseCollectorType.CounterCup) && col.Active)
+			{
+				activeCups.Add(col.Appearance.Label);
+			}
+		}
+
+		Instrument.ProtectAllCounterCupsWithPostDelay(Instrument.BaseSettingsData.CounterProtectionPreDelay);
+		if (activeCups.Count > 0)
+		{
+			Instrument.UnprotectRequiredCounterCups(activeCups);
+		}
+	}
+
+	// Mass on a cup = GammaCorrection * axial mass (see GetActualMass in CSIRORemoteControlServer.cs)
+	private static double? ConvertMassToAxial(string name, double mass)
+	{
+		string id = mGetDetectorIdentifier(name);
+		IRMSBaseCupConfigurationData activeCupData = Instrument.CupConfigurationDataList.GetActiveCupConfiguration();
+		foreach(IRMSBaseCollectorItem col in activeCupData.CollectorItemList)
+		{
+			if ((col.Identifier == id || col.Appearance.Label == name) && col.GammaCorrection != 0)
+			{
+				return mass / col.GammaCorrection;
+			}
+		}
+		return null;
+	}
+
     private static string SetMass(double m, string cup)
 	{
 		// First deactivate CDDs to protect them.
@@ -696,9 +781,9 @@ class RemoteControl
 		// If mass is not for AX cup, convert the mass to a value for the AX cup
 		double AXMass = m;
 		log(AXMass.ToString());
-		if (cup!="AX")
+		if (cup!=null && cup.Trim()!="AX")
 		{
-			double? tempMass = ConvertMassToAxial(cup,m);
+			double? tempMass = ConvertMassToAxial(cup.Trim(),m);
 			if (!tempMass.HasValue)
 			{
 				return "Error: Cup not recognized";
@@ -715,8 +800,7 @@ class RemoteControl
 		int count = 0;
 		while (currentMass != AXMass) //For large changes, do it stepwise to avoid ringing
 		{
-			if ((Math.Abs(currentMass-AXMass)/currentMass) < Config.magnet_move_threshold_rel_mass) //for smallk
-			changes
+			if ((Math.Abs(currentMass-AXMass)/currentMass) < Config.magnet_move_threshold_rel_mass) //for small changes
 			{
 				currentMass = AXMass;
 			}

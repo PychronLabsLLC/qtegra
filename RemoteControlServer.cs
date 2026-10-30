@@ -75,6 +75,7 @@ static class Config
     public static double magnet_move_threshold=0.25;// threshold to trigger stepped magnet move in DAC units
     public static int magnet_steps=20; // number of steps to divide the total magnet displacement
     public static int magnet_step_time=100; //ms to delay between magnet steps
+    public static bool probe_scan_data=true; // log the structure of the first scan received. also see ProbeScanData command
 
 }
 
@@ -104,6 +105,7 @@ class RemoteControl
 
     private static bool MAGNET_MOVING=false;
     private static bool CDDS_ARE_ON = false; // keeps track of CDD state as long as this is done through "ActivateAllCDDs" and "DeactivateAllCDDs"
+    private static volatile bool PROBE_PENDING = Config.probe_scan_data;
 
     public static void Main ()
     {
@@ -154,6 +156,7 @@ class RemoteControl
     //      GetTuningSettingsList #return a comma separated string
     //      SetTuningSettings
     //      GetData returns tagged data e.g. H2,aaa,L1,bbb,CDD,ccc
+    //      ProbeScanData #log the structure of the next scan to the Qtegra log (diagnostic)
     //      SetIntegrationTime <seconds>
     //      GetIntegrationTime <seconds>
     //      BlankBeam <true or false> if true set y-symmetry to -50 else return to previous value
@@ -241,6 +244,12 @@ class RemoteControl
 
 		case "GetData":
 			result=SCAN_DATA;
+			break;
+
+		case "ProbeScanData":
+			// log the structure of the next scan received. diagnostic only
+			PROBE_PENDING=true;
+			result="OK";
 			break;
 
 		case "SetIntegrationTime":
@@ -944,6 +953,12 @@ class RemoteControl
 			Spectrum spec = e.Value.Clone() as Spectrum;
 			IRMSBaseCupConfigurationData cupData = Instrument.CupConfigurationDataList.GetActiveCupConfiguration();
 
+			if (PROBE_PENDING)
+			{
+				PROBE_PENDING=false;
+				ProbeScanData(spec, cupData);
+			}
+
 			foreach (Series series in spec)
 			{
 				foreach (SpectrumData point in series)
@@ -969,6 +984,78 @@ class RemoteControl
 			}
 			data.Reverse();
 			SCAN_DATA=string.Join(",",data.ToArray());
+		}
+	}
+
+	// Diagnostic: log what a scan contains so we can tell whether a Series knows which
+	// detector it came from, and how far point masses drift from the cup configuration masses.
+	private static void ProbeScanData(Spectrum spec, IRMSBaseCupConfigurationData cupData)
+	{
+		try
+		{
+			log("==== ProbeScanData start ====");
+			log(String.Format("ActualScanMass={0}", Instrument.MeasurementInfo.ActualScanMass));
+			foreach (IRMSBaseCollectorItem item in cupData.CollectorItemList)
+			{
+				log(String.Format("Collector Identifier={0}, Label={1}, Type={2}, Active={3}, Mass={4}, GammaCorrection={5}",
+					item.Identifier, item.Appearance.Label, item.CollectorType, item.Active, item.Mass, item.GammaCorrection));
+			}
+
+			logproperties(spec, "Spectrum");
+			listattributes(spec.GetType(), "Spectrum");
+
+			int i=0;
+			foreach (Series series in spec)
+			{
+				logproperties(series, String.Format("Series[{0}]", i));
+				if (i==0)
+				{
+					listattributes(series.GetType(), "Series");
+				}
+
+				int j=0;
+				foreach (SpectrumData point in series)
+				{
+					if (j>=20)
+					{
+						log(String.Format("Series[{0}] has more points, not logged", i));
+						break;
+					}
+					logproperties(point, String.Format("Series[{0}].Point[{1}]", i, j));
+					if (i==0 && j==0)
+					{
+						listattributes(point.GetType(), "SpectrumData");
+					}
+					j++;
+				}
+				i++;
+			}
+			log("==== ProbeScanData end ====");
+		}
+		catch (Exception e)
+		{
+			Logger.Log(LogLevel.Warning, String.Format("ProbeScanData failed. {0}", e));
+		}
+	}
+
+	private static void logproperties(object obj, string identifier)
+	{
+		foreach (PropertyInfo pi in obj.GetType().GetProperties())
+		{
+			if (pi.GetIndexParameters().Length>0)
+			{
+				continue;
+			}
+			string value;
+			try
+			{
+				value=String.Format("{0}", pi.GetValue(obj, null));
+			}
+			catch (Exception e)
+			{
+				value=String.Format("<{0}>", e.GetType().Name);
+			}
+			log(String.Format("{0}.{1}={2}", identifier, pi.Name, value));
 		}
 	}
 

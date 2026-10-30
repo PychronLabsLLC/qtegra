@@ -18,15 +18,16 @@ descriptive error, is returned to the client.
 Files
 =====
     RemoteControlServer.cs          the server script, run inside Qtegra
-    rcs_protocol.txt                command reference
+    PROTOCOL.md                     protocol and command reference (generated)
     RemoteControlServerChanges.txt  change log
     CSIRORemoteControlServer.cs     fork maintained by CSIRO (Suckow, Deslandes, Gerber)
     SampleFunctionScript.cs,
     SampleFunctionIncludeScript.cs,
     activate_ion_counter            Thermo sample code the server borrows from
     protocol.txt                    Pychron system/laser protocol (not Qtegra)
-    tools/offline_check/            compile + dispatcher check without Qtegra
+    tools/offline_check/            compile, PROTOCOL.md and server checks without Qtegra
     tools/smoke_test.py             read-only test client for a running server
+    tools/list_parameters.py        candidate parameter names from a .imhwd file
 
 Running
 =======
@@ -64,43 +65,15 @@ Everything else is in the Config class at the top of the script:
 
 Protocol
 ========
-Commands are ASCII, case sensitive and CamelCase, with arguments separated from
-the command by a space, e.g. "SetMagnetDAC 5.1" or "SetDeflection AX,100".
-Numbers always use "." as the decimal separator, whatever the Windows locale.
-Each command gets exactly one reply: a value, "OK", or a line starting with
-"Error:".
-
-    Help        lists every command
-    GetVersion  returns the script version
-    Ping        returns OK
-
-See rcs_protocol.txt for the full command list.
-
-Request ids: prefix any command with "#<id> " and the reply comes back as
-"#<id> <reply>", so a client can match replies to requests and drop late ones.
-If the same client repeats the same id and command within request_id_window
-ms (a UDP retry), it gets the cached reply and the command is not run again.
-
-Scan data: GetDataN returns "<scan count>|<data>"; the count goes up by one for
-every scan. GetNextData [timeout s] [scan count] waits for a newer scan instead
-of polling. Over UDP a waiting GetNextData holds up the other commands, so
-prefer TCP for it.
-
-TCP: each connection gets its own thread, and a client that sends nothing is
-dropped after tcp_read_timeout ms. By default a connection handles one
-command: connect, send it, read the reply until the server closes the
-connection. If the first command is
-    KeepAlive   the connection stays open: send newline terminated commands,
-                each reply ends with a newline
-    Subscribe   the server writes "<scan count>|<data>" + newline for every scan
-                until the client disconnects (also allowed after KeepAlive)
-
-Commands that only read the script's own state (GetData*, GetMagnetMoving,
-Ping, Help, GetVersion, ProbeScanData) answer straight away. Hardware commands
-run one at a time.
+See PROTOCOL.md: message format, request ids, UDP and TCP (KeepAlive,
+Subscribe), error replies, every command, and how to find hardware parameter
+names. A running server also answers "Help" and "Help <command>".
 
 Diagnostics
 ===========
+ProbeInstrument logs the instrument object's properties and members, to look
+for a way to list its hardware parameters from the script.
+
 ProbeScanData logs what the next scan contains (collector masses, gamma
 corrections, and the properties of Spectrum, Series and SpectrumData) to the
 Qtegra log. It also runs once on the first scan when probe_scan_data is true.
@@ -114,23 +87,31 @@ Without Qtegra (needs the .NET SDK):
     tools/offline_check/run.sh
 
 This compiles RemoteControlServer.cs as C# 4 against stand-ins for the Thermo
-types, then runs commands, request ids, scan data and the UDP and TCP servers
-with a fake instrument. The stand-ins are guessed from how the script uses the
+types, checks PROTOCOL.md is up to date, then runs commands, request ids, scan
+data and the UDP and TCP servers with a fake instrument. The stand-ins are guessed from how the script uses the
 Thermo API, so passing here does not guarantee the script compiles in Qtegra.
 
 Against a running server (Python 3, read-only commands only):
 
     python3 tools/smoke_test.py <host> [--port 1069] [--tcp] [--detectors H1,AX,CDD]
+                                [--parameters names.txt]
 
 Adding commands
 ===============
-Register the command in RegisterCommands():
+Register the command in RegisterCommands(), under the right Section(...):
 
-    Register("GetFoo", (a, rest) => ReadParameter("Foo Set", 1));
+    Register("GetFoo", "", "<value> | Error", "Foo Set, in V.",
+        (a, rest) => ReadParameter("Foo Set", 1));
 
-a is the command split on spaces (a[0] is the command name), rest is
-everything after the command name. Return a value, "OK" or "Error: ...".
-Missing arguments and bad numbers are turned into error replies for you.
+The arguments are: name, arguments, reply, description, handler. Use
+RegisterQuick for commands that do not touch the hardware. In the handler, a is
+the command split on spaces (a[0] is the command name) and rest is everything
+after the command name. Return a value, "OK" or "Error: ...". Missing arguments
+and bad numbers are turned into error replies for you.
+
+Then regenerate the docs:
+
+    tools/offline_check/run.sh --update-protocol
 
 Instrument is the entry point into the Qtegra core, e.g.
 

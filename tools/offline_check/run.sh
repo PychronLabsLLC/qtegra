@@ -1,6 +1,10 @@
 #!/bin/sh
-# Compile RemoteControlServer.cs against stand-ins for the Thermo types and run
-# the dispatcher test. Needs the .NET SDK (dotnet). Does not need Qtegra.
+# Compile RemoteControlServer.cs against stand-ins for the Thermo types, check that
+# PROTOCOL.md matches the command definitions, and run the tests.
+# Needs the .NET SDK (dotnet). Does not need Qtegra.
+#
+#   run.sh                     check and test
+#   run.sh --update-protocol   regenerate PROTOCOL.md, then check and test
 set -e
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -36,4 +40,15 @@ echo "compiled"
 
 printf '{"runtimeOptions":{"tfm":"%s","rollForward":"LatestMajor","framework":{"name":"Microsoft.NETCore.App","version":"%s"}}}' \
     "$tfm" "${tfm#net}" > "$build/check.runtimeconfig.json"
+protocol="$root/PROTOCOL.md"
+"$dotnet" "$build/check.dll" --protocol "$here/protocol_header.md" "$build/PROTOCOL.md"
+if [ "$1" = "--update-protocol" ]; then
+    cp "$build/PROTOCOL.md" "$protocol"
+    echo "updated PROTOCOL.md"
+elif ! cmp -s "$build/PROTOCOL.md" "$protocol"; then
+    diff -u "$protocol" "$build/PROTOCOL.md" | head -40 || true
+    echo "PROTOCOL.md is out of date: run tools/offline_check/run.sh --update-protocol"
+    exit 1
+fi
+
 "$dotnet" "$build/check.dll"

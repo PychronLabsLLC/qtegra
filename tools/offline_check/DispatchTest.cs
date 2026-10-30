@@ -21,8 +21,16 @@ static class DispatchTest
     const int UdpPort = 18072;
     static int failures = 0;
 
-    static int Main()
+    static int Main(string[] argv)
     {
+        // --protocol <header.md> <output.md>: write PROTOCOL.md instead of running the tests
+        if (argv.Length == 3 && argv[0] == "--protocol")
+        {
+            typeof(RemoteControl).GetMethod("RegisterCommands", Flags).Invoke(null, null);
+            File.WriteAllText(argv[2], ProtocolMarkdown(File.ReadAllText(argv[1])));
+            return 0;
+        }
+
         // a comma-decimal locale, to prove numbers do not depend on the Windows locale
         Thread.CurrentThread.CurrentCulture = new CultureInfo("de-DE");
         Config.probe_scan_data = false;
@@ -43,6 +51,13 @@ static class DispatchTest
         Check("GetVersion", Run("GetVersion"), r => r.Length > 0 && !r.StartsWith("Error"));
         Check("Help", Run("Help"), r => r.Contains("GetData") && r.Contains("SetMass") && r.Contains("GetNextData"));
         Check("Ping", Run("Ping"), r => r == "OK");
+        Check("Help SetMass", Run("Help SetMass"), r => r.StartsWith("SetMass <mass>[,<cup>] -> OK | Error."));
+        Check("Help Nope", Run("Help Nope"), r => r == "Error: unknown command Nope");
+        Check("KeepAlive over dispatcher", Run("KeepAlive"), r => r.StartsWith("Error: KeepAlive must be the first"));
+        Check("GetParameter Nope Set", Run("GetParameter Nope Set"), r => r == "Error: could not read Nope Set");
+        Check("GetParameters with spaces", Run("GetParameters Field Set, Nope Set"), r => r == "0,0");
+        Check("CheckParameters", Run("CheckParameters Field Set,Nope Set"), r => r == "True,False");
+        Check("ProbeInstrument", Run("ProbeInstrument"), r => r == "OK");
         Check("NoSuchCommand", Run("NoSuchCommand"), r => r == "Error: Invalid Command");
         Check("<empty>", Run(""), r => r == "Error: Invalid Command");
         Check("SetMagnetDAC", Run("SetMagnetDAC"), r => r == "Error: missing argument for SetMagnetDAC");
@@ -140,6 +155,31 @@ static class DispatchTest
 
         Console.WriteLine(failures == 0 ? "\nall passed" : "\n" + failures + " failed");
         return failures == 0 ? 0 : 1;
+    }
+
+    // PROTOCOL.md: the header, then one table per section from the command definitions
+    static string ProtocolMarkdown(string header)
+    {
+        var list = (System.Collections.IList)typeof(RemoteControl).GetField("COMMAND_LIST", Flags).GetValue(null);
+        var sb = new StringBuilder(header.TrimEnd() + "\n");
+        string section = null;
+        foreach (object c in list)
+        {
+            Func<string, string> field = name => (string)c.GetType().GetField(name).GetValue(c);
+            if (field("Section") != section)
+            {
+                section = field("Section");
+                sb.Append("\n## " + section + "\n\n| Command | Arguments | Reply | Description |\n|---|---|---|---|\n");
+            }
+            sb.AppendFormat("| `{0}` | {1} | {2} | {3} |\n", field("Name"), Code(field("Args")), Code(field("Returns")),
+                            field("Description").Replace("<", "&lt;").Replace(">", "&gt;").Replace("|", "\\|"));
+        }
+        return sb.ToString();
+    }
+
+    static string Code(string text)
+    {
+        return text.Length == 0 ? "" : "`" + text.Replace("|", "\\|") + "`";
     }
 
     static string Run(string cmd)

@@ -5,6 +5,10 @@ Sends only Get* commands plus a few malformed commands that the server rejects
 before touching any hardware, and checks every reply.
 
     python3 tools/smoke_test.py <host> [--port 1069] [--tcp] [--detectors H1,AX,CDD]
+                                       [--parameters names.txt]
+
+--parameters also checks which of the listed hardware parameter names the server
+can read (see tools/list_parameters.py). Unreadable names are reported, not failed.
 
 Exit code is 0 when every check passes, 1 otherwise.
 """
@@ -71,6 +75,7 @@ def build_checks(detectors):
         ("GetHighVoltage", is_number, "number (V)"),
         ("GetHV", is_number, "number (kV)"),
         ("GetIonCounterVoltage", is_number, "number"),
+        ("CheckParameters Field Set", lambda r: r == "True", "True"),
         ("GetDeflections " + ",".join(detectors),
          lambda r: len(r.split(",")) == len(detectors) and all(is_number(v) for v in r.split(",")),
          "one number per detector"),
@@ -101,6 +106,40 @@ def check_keepalive(host, port, timeout):
     return 0 if passed else 1
 
 
+def check_parameters(send, host, port, timeout, path):
+    """CheckParameters for every name in path (one per line, # comments). Returns failures."""
+    with open(path) as f:
+        names = [line.strip() for line in f if line.strip() and not line.startswith("#")]
+    # keep each request well under the server's 1024 byte UDP buffer
+    batches, batch = [], []
+    for name in names:
+        if batch and len("CheckParameters " + ",".join(batch + [name])) > 900:
+            batches.append(batch)
+            batch = []
+        batch.append(name)
+    if batch:
+        batches.append(batch)
+
+    readable, unreadable = [], []
+    for batch in batches:
+        try:
+            reply = send(host, port, "CheckParameters " + ",".join(batch), timeout)
+        except (OSError, socket.timeout) as e:
+            print("FAIL CheckParameters <{}>".format(e))
+            return 1
+        flags = reply.split(",")
+        if len(flags) != len(batch):
+            print("FAIL CheckParameters unexpected reply: {:.80}".format(reply))
+            return 1
+        for name, flag in zip(batch, flags):
+            (readable if flag == "True" else unreadable).append(name)
+
+    print("\n{} of {} parameters readable".format(len(readable), len(names)))
+    for name in unreadable:
+        print("     not readable: {}".format(name))
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("host")
@@ -109,6 +148,7 @@ def main():
     parser.add_argument("--timeout", type=float, default=5.0)
     parser.add_argument("--detectors", default="H1,AX,CDD",
                         help="comma separated detector names (default: Helix SFT)")
+    parser.add_argument("--parameters", help="file of parameter names to check, one per line")
     args = parser.parse_args()
 
     send = send_tcp if args.tcp else send_udp
@@ -128,6 +168,8 @@ def main():
 
     if args.tcp:
         failures += check_keepalive(args.host, args.port, args.timeout)
+    if args.parameters:
+        failures += check_parameters(send, args.host, args.port, args.timeout, args.parameters)
 
     print("\n{} failed".format(failures) if failures else "\nall passed")
     return 1 if failures else 0

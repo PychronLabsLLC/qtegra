@@ -86,6 +86,7 @@ class RemoteControl
     private static Socket UDP_SOCK;
     private static Thread SERVER_THREAD;
     private static TcpListener TCPLISTENER;
+    private static volatile bool RUNNING=true;
 
     private static double LAST_Y_SYMMETRY=0;
     private static bool IsBLANKED=false;
@@ -103,7 +104,8 @@ class RemoteControl
 
 	private static List<string> DETECTOR_NAMES;
 
-    private static bool MAGNET_MOVING=false;
+    private static volatile bool MAGNET_MOVING=false;
+    private static object m_magnet_lock=new object();
     private static bool CDDS_ARE_ON = false; // keeps track of CDD state as long as this is done through "ActivateAllCDDs" and "DeactivateAllCDDs"
     private static volatile bool PROBE_PENDING = Config.probe_scan_data;
 
@@ -209,15 +211,47 @@ class RemoteControl
 
 	private static string ParseAndExecuteCommand (string cmd)
 	{
+		string result;
+		Logger.Log(LogLevel.UserInfo, String.Format("Executing {0}", cmd));
+		try
+		{
+			result = ExecuteCommand(cmd);
+		}
+		catch (IndexOutOfRangeException)
+		{
+			result = String.Format("Error: missing argument for {0}", cmd);
+		}
+		catch (FormatException)
+		{
+			result = String.Format("Error: invalid number in {0}", cmd);
+		}
+		catch (Exception e)
+		{
+			Logger.Log(LogLevel.UserError, String.Format("{0} failed. {1}", cmd, e));
+			result = String.Format("Error: {0}", e.Message);
+		}
+
+		if (result == null)
+		{
+			result = "Error: no result";
+		}
+		log(String.Format("{0} => {1}", cmd, result));
+		return result;
+	}
+
+	private static string ExecuteCommand (string cmd)
+	{
 
 		string result = "Error: Invalid Command";
-		Logger.Log(LogLevel.UserInfo, String.Format("Executing {0}", cmd));
 
-		string[] args = cmd.Trim().Split (' ');
+		string[] args = cmd.Trim().Split (new char[]{' '}, StringSplitOptions.RemoveEmptyEntries);
+		if (args.Length == 0)
+		{
+			return result;
+		}
 		string[] pargs;
 		string jargs;
 
-        double r;
         switch (args[0]) {
 
         case "GetDeflections":
@@ -243,7 +277,7 @@ class RemoteControl
 			break;
 
 		case "GetData":
-			result=SCAN_DATA;
+			result=SCAN_DATA ?? "Error: no data";
 			break;
 
 		case "ProbeScanData":
@@ -253,7 +287,7 @@ class RemoteControl
 			break;
 
 		case "SetIntegrationTime":
-			result=SetIntegrationTime(Convert.ToDouble(args[1]));
+			result=SetIntegrationTime(ToDouble(args[1]));
 			break;
 		case "GetIntegrationTime":
 			result=GetIntegrationTime();
@@ -309,6 +343,11 @@ class RemoteControl
         case "GetSubCupConfigurationList":
             string config_name = args[1];
             List<string> sub_names = GetSubCupConfigurations (config_name);
+            if (sub_names == null)
+            {
+                result = String.Format("Error: could not find cup configuration {0}", config_name);
+                break;
+            }
             result = string.Join ("\r", sub_names.ToArray ());
             break;
 
@@ -364,12 +403,11 @@ class RemoteControl
 //   Magnet
 //============================================================================================
         case "GetMagnetDAC":
-            if (Instrument.GetParameter("Field Set", out r))
-            {result=r.ToString();}
+            result=ReadParameter("Field Set", 1);
             break;
 
         case "SetMagnetDAC":
-            result=SetMagnetDAC(Convert.ToDouble(args[1]));
+            result=SetMagnetDAC(ToDouble(args[1]));
             break;
         case "GetMagnetMoving":
             result=GetMagnetMoving();
@@ -378,30 +416,24 @@ class RemoteControl
             //Adapted from CSIRORemoteControlServer.cs
 			jargs=String.Join(" ", Slice(args,1,0));
             pargs=jargs.Split(',');
-		   result = SetMass(Convert.ToDouble(pargs[0]),(pargs.Length>1) ? pargs[1] : null);
+		   result = SetMass(ToDouble(pargs[0]),(pargs.Length>1) ? pargs[1] : null);
             break;
 //============================================================================================
 //    Source Parameters
 //============================================================================================
 		case "GetHighVoltage":
-			if(Instrument.GetParameter("Acceleration Reference Set",out r))
-			{
-				result=(r*1000).ToString();
-			}
+			result=ReadParameter("Acceleration Reference Set", 1000);
 			break;
 
 		case "SetHighVoltage":
-			result=SetParameter("Acceleration Reference Set", Convert.ToDouble(args[1])/1000.0);
+			result=SetParameter("Acceleration Reference Set", ToDouble(args[1])/1000.0);
 			break;
 		case "GetHV":
-			if(Instrument.GetParameter("Acceleration Reference Set",out r))
-			{
-				result=(r).ToString();
-			}
+			result=ReadParameter("Acceleration Reference Set", 1);
 			break;
 
 		case "SetHV":
-			result=SetParameter("Acceleration Reference Set", Convert.ToDouble(args[1])/1000.0);
+			result=SetParameter("Acceleration Reference Set", ToDouble(args[1])/1000.0);
 			break;
 //============================================================================================
 //    Detectors
@@ -414,23 +446,21 @@ class RemoteControl
 
         case "GetDeflection":
             jargs=String.Join(" ", Slice(args,1,0));
-            if(Instrument.GetParameter(String.Format("Deflection {0} Set",jargs), out r))
-            {result=r.ToString();}
+            result=ReadParameter(String.Format("Deflection {0} Set",jargs), 1);
             break;
 
         case "SetDeflection":
             jargs=String.Join(" ", Slice(args,1,0));
             pargs=jargs.Split(',');
-            result=SetParameter(String.Format("Deflection {0} Set",pargs[0]),Convert.ToDouble(pargs[1]));
+            result=SetParameter(String.Format("Deflection {0} Set",pargs[0]),ToDouble(pargs[1]));
             break;
 
         case "GetIonCounterVoltage":
-            if(Instrument.GetParameter("CDD Supply Set",out r))
-            {result=r.ToString();}
+            result=ReadParameter("CDD Supply Set", 1);
             break;
 
         case "SetIonCounterVoltage":
-            result=SetParameter("CDD Supply Set", Convert.ToDouble(args[1]));
+            result=SetParameter("CDD Supply Set", ToDouble(args[1]));
             break;
 
         case "GetGain":
@@ -441,8 +471,7 @@ class RemoteControl
         case "SetGain":
             jargs=String.Join(" ", Slice(args,1,0));
             pargs=jargs.Split(',');
-            result="OK";
-            SetGain(pargs[0], Convert.ToDouble(pargs[1]));
+            result=SetGain(pargs[0], ToDouble(pargs[1]));
             break;
 
         case "ActivateAllCDDs":
@@ -457,19 +486,15 @@ class RemoteControl
 //============================================================================================
 		case "GetParameter":
 		    jargs=String.Join(" ", Slice(args,1,0));
-			if(Instrument.GetParameter(jargs, out r))
-			{
-				result=r.ToString();
-			}
+			result=ReadParameter(jargs, 1);
 			break;
 
 		case "SetParameter":
 		    jargs=String.Join(" ", Slice(args,1,0));
             pargs=jargs.Split(',');
-		  result=SetParameter(pargs[0], Convert.ToDouble(pargs[1]));
+		  result=SetParameter(pargs[0], ToDouble(pargs[1]));
 		  break;
 		}
-		log(String.Format("{0} => {1}", cmd, result));
 		return result;
 	}
 //============================================================================================
@@ -495,17 +520,21 @@ class RemoteControl
         // deattach the handler from the ScanDataAvailable Event
         Instrument.ScanDataAvailable-=ScanDataAvailable;
 
-        //shutdown the server
-        if (Config.use_udp)
+        //shutdown the server. closing the socket unblocks the listen loop, which then sees RUNNING=false
+        RUNNING=false;
+        if (UDP_SOCK != null)
         {
             UDP_SOCK.Close();
         }
-        else
+        if (TCPLISTENER != null)
         {
             TCPLISTENER.Stop();
         }
 
-        SERVER_THREAD.Abort();
+        if (SERVER_THREAD != null && !SERVER_THREAD.Join(2000))
+        {
+            SERVER_THREAD.Abort();
+        }
 
     }
 
@@ -525,7 +554,7 @@ class RemoteControl
             {
                 v = 0;
             }
-            data.Add(v.ToString());
+            data.Add(Fmt(v));
         }
 
         return string.Join(",",data.ToArray());
@@ -541,7 +570,7 @@ class RemoteControl
            {
                 v = 0;
            }
-           data.Add(v.ToString());
+           data.Add(Fmt(v));
         }
 
         return string.Join(",",data.ToArray());
@@ -645,9 +674,31 @@ class RemoteControl
 
 		if (!Instrument.SetParameter(hwname, val))
 		{
-			result=String.Format("Error: could not set {0} to {1}", hwname, val);
+			result=String.Format("Error: could not set {0} to {1}", hwname, Fmt(val));
 		}
 		return result;
+	}
+
+	// read a hardware parameter, multiplied by scale, formatted for the client
+	public static string ReadParameter(string hwname, double scale)
+	{
+		double r;
+		if (!Instrument.GetParameter(hwname, out r))
+		{
+			return String.Format("Error: could not read {0}", hwname);
+		}
+		return Fmt(r*scale);
+	}
+
+	// numbers to and from clients always use "." as the decimal separator, whatever the Windows locale
+	private static double ToDouble(string s)
+	{
+		return Double.Parse(s.Trim(), NumberStyles.Float, CultureInfo.InvariantCulture);
+	}
+
+	private static string Fmt(double v)
+	{
+		return v.ToString(CultureInfo.InvariantCulture);
 	}
 
     private static string ActivateAllCDDs()
@@ -781,6 +832,22 @@ class RemoteControl
 
     private static string SetMass(double m, string cup)
 	{
+		if (!TryStartMagnetMove())
+		{
+			return "Error: magnet is moving";
+		}
+		try
+		{
+			return mSetMass(m, cup);
+		}
+		finally
+		{
+			MAGNET_MOVING=false;
+		}
+	}
+
+	private static string mSetMass(double m, string cup)
+	{
 		// First deactivate CDDs to protect them.
 		if (!(DeactivateAllCDDs()=="OK"))
 		{
@@ -789,7 +856,7 @@ class RemoteControl
 
 		// If mass is not for AX cup, convert the mass to a value for the AX cup
 		double AXMass = m;
-		log(AXMass.ToString());
+		log(Fmt(AXMass));
 		if (cup!=null && cup.Trim()!="AX")
 		{
 			double? tempMass = ConvertMassToAxial(cup.Trim(),m);
@@ -809,7 +876,8 @@ class RemoteControl
 		int count = 0;
 		while (currentMass != AXMass) //For large changes, do it stepwise to avoid ringing
 		{
-			if ((Math.Abs(currentMass-AXMass)/currentMass) < Config.magnet_move_threshold_rel_mass) //for small changes
+			if (currentMass<=0 || count>=100 ||
+				(Math.Abs(currentMass-AXMass)/currentMass) < Config.magnet_move_threshold_rel_mass) //for small changes
 			{
 				currentMass = AXMass;
 			}
@@ -838,19 +906,31 @@ class RemoteControl
 		string result="OK";
 		double current_dac;
 
-		if (Instrument.GetParameter("Field Set", out current_dac))
+		if (!Instrument.GetParameter("Field Set", out current_dac))
 		{
-			double dev=Math.Abs(d-current_dac);
-			if (dev>Config.magnet_move_threshold)
-			{
-                Thread t= new Thread(delegate(){mSetMagnetDAC(d,dev,current_dac);});
-                t.Start();
+			return "Error: could not read Field Set";
+		}
+		if (!TryStartMagnetMove())
+		{
+			return "Error: magnet is moving";
+		}
 
-                result="OK";
-            }
-            else
+		double dev=Math.Abs(d-current_dac);
+		if (dev>Config.magnet_move_threshold)
+		{
+            // MAGNET_MOVING stays true until the stepping thread finishes
+            Thread t= new Thread(delegate(){mSetMagnetDAC(d,dev,current_dac);});
+            t.Start();
+        }
+        else
+        {
+            try
             {
                 result=SetParameter("Field Set", d);
+            }
+            finally
+            {
+                MAGNET_MOVING=false;
             }
         }
         return result;
@@ -859,30 +939,53 @@ class RemoteControl
 
     public static void mSetMagnetDAC(double d, double dev, double current_dac)
     {
-        MAGNET_MOVING=true;
-        //incrementally move the magnet to eliminate "ringing"
-        double step=dev/Config.magnet_steps;
-        int sign=1;
-
-        if (current_dac>d)
+        try
         {
-            sign=-1;
-        }
+            //incrementally move the magnet to eliminate "ringing"
+            double step=dev/Config.magnet_steps;
+            int sign=1;
 
-        for(int i=1; i<=Config.magnet_steps; i++)
-        {
-            SetParameter("Field Set", current_dac+sign*i*step);
-            if (Config.magnet_step_time>0)
+            if (current_dac>d)
             {
-                Thread.CurrentThread.Join(Config.magnet_step_time);
+                sign=-1;
+            }
+
+            for(int i=1; i<=Config.magnet_steps; i++)
+            {
+                SetParameter("Field Set", current_dac+sign*i*step);
+                if (Config.magnet_step_time>0)
+                {
+                    Thread.CurrentThread.Join(Config.magnet_step_time);
+                }
             }
         }
-        MAGNET_MOVING=false;
+        catch (Exception e)
+        {
+            Logger.Log(LogLevel.UserError, String.Format("Magnet move failed. {0}", e));
+        }
+        finally
+        {
+            MAGNET_MOVING=false;
+        }
+    }
+
+    // only one magnet move (SetMagnetDAC or SetMass) at a time
+    private static bool TryStartMagnetMove()
+    {
+        lock(m_magnet_lock)
+        {
+            if (MAGNET_MOVING)
+            {
+                return false;
+            }
+            MAGNET_MOVING=true;
+            return true;
+        }
     }
 
     public static string GetIntegrationTime()
     {
-        string result=String.Format("{0}", Instrument.MeasurementInfo.IntegrationTime*0.001);
+        string result=Fmt(Instrument.MeasurementInfo.IntegrationTime*0.001);
         return result;
     }
 
@@ -895,13 +998,13 @@ class RemoteControl
         if (!Instrument.ScanTransitionController.StartMonitoring (nMI))
         {
             Logger.Log(LogLevel.UserError, "Could not start the modified monitor");
-            result=String.Format("Error: could not set integration time to {0}",t);
+            result=String.Format("Error: could not set integration time to {0}",Fmt(t));
         }
 
         return result;
     }
 
-    public static void SetGain(String name, double v)
+    public static string SetGain(String name, double v)
     {
         string id = mGetDetectorIdentifier(name);
         foreach (UFCCalibrationData item in Instrument.UFCCalibrationData)
@@ -909,26 +1012,23 @@ class RemoteControl
             if (item.Identifier==id)
             {
                 item.Gain=v;
-                break;
+                return "OK";
             }
         }
-
+        return String.Format("Error: unknown detector {0}", name);
     }
 
     public static string GetGain(String name)
     {
-        double gain=0;
         string id = mGetDetectorIdentifier(name);
         foreach (UFCCalibrationData item in Instrument.UFCCalibrationData)
         {
             if (item.Identifier==id)
             {
-                gain=Convert.ToDouble(item.Gain);
-                break;
+                return Fmt(Convert.ToDouble(item.Gain));
             }
         }
-
-	  return String.Format("{0}",gain);
+        return String.Format("Error: unknown detector {0}", name);
 	}
 
     private static string get_cup_name(IRMSBaseCollectorItem item)
@@ -970,7 +1070,7 @@ class RemoteControl
 						{	string cupName=get_cup_name(item);
 
 
-							data.Add(point.Analog.ToString());
+							data.Add(Fmt(point.Analog));
 							if (Config.tag_data)
 							{
 								data.Add(cupName);
@@ -1089,7 +1189,11 @@ class RemoteControl
 				cupData.CollectorItemList,
 				cupData.MassCalibration
 				);
-		Instrument.ScanTransitionController.StartMonitoring(newMeasurementInfo);
+		if (!Instrument.ScanTransitionController.StartMonitoring(newMeasurementInfo))
+		{
+			Logger.Log(LogLevel.UserError, "Could not start monitor scan");
+			return false;
+		}
 		return true;
 	}
 
@@ -1263,7 +1367,7 @@ class RemoteControl
         IPEndPoint sender = new IPEndPoint(IPAddress.Any, 0);
         EndPoint remote = (EndPoint)(sender);
 
-        while(true)
+        while(RUNNING)
         {
             try
             {
@@ -1275,8 +1379,12 @@ class RemoteControl
                 //Logger.Log(LogLevel.Debug, String.Format("Sending back {0}", result));
                 UDP_SOCK.SendTo(Encoding.ASCII.GetBytes(result), remote);
             } catch (Exception e) {
-            string error = string.Format ("Could not read from UDP sock. {0}", e.ToString ());
-            Logger.Log(LogLevel.Warning, error);
+                if (!RUNNING)
+                {
+                    break;
+                }
+                string error = string.Format ("Could not read from UDP sock. {0}", e.ToString ());
+                Logger.Log(LogLevel.Warning, error);
             }
 
         }
@@ -1286,8 +1394,19 @@ class RemoteControl
 
         Logger.Log (LogLevel.UserInfo, "TCP Listening");
 
-        while (true) {
-            TCPHandle(TCPLISTENER.AcceptTcpClient ());
+        while (RUNNING) {
+            try
+            {
+                TCPHandle(TCPLISTENER.AcceptTcpClient ());
+            }
+            catch (Exception e)
+            {
+                if (!RUNNING)
+                {
+                    break;
+                }
+                Logger.Log(LogLevel.Warning, String.Format("TCP client failed. {0}", e));
+            }
 
             //TcpClient client = TCPLISTENER.AcceptTcpClient ();
             //Thread clientThread = new Thread (new ParameterizedThreadStart (TCPHandle));
@@ -1299,14 +1418,19 @@ class RemoteControl
     {
         //TcpClient tcpClient = (TcpClient)client;
 
-        NetworkStream _stream = tcpClient.GetStream ();
-        //string response = Read (_stream);
+        try
+        {
+            NetworkStream _stream = tcpClient.GetStream ();
+            //string response = Read (_stream);
 
-        string result = ParseAndExecuteCommand (TCPRead(_stream).Trim());
+            string result = ParseAndExecuteCommand (TCPRead(_stream).Trim());
 
-        TCPWrite(_stream, result);
-
-        tcpClient.Close();
+            TCPWrite(_stream, result);
+        }
+        finally
+        {
+            tcpClient.Close();
+        }
     }
     //====================================================================================================================================
     //Network Methods
@@ -1315,7 +1439,7 @@ class RemoteControl
     private static void TCPWrite (NetworkStream stream, string cmd)
     {
         if (stream.CanWrite) {
-            Byte[] sendBytes = Encoding.UTF8.GetBytes (cmd);
+            Byte[] sendBytes = Encoding.ASCII.GetBytes (cmd);
             stream.Write (sendBytes, 0, sendBytes.Length);
         }
     }

@@ -27,6 +27,7 @@ __version__=20.2
 
 using System.IO;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Net;
 using System.Net.Sockets;
 using System.Collections.Generic;
@@ -97,6 +98,8 @@ class RemoteControl
     private static Dictionary<string, double> m_defl = new Dictionary<string, double>();
 
     private const string VERSION = "20.2"; // keep in sync with __version__ in the header
+    private const int PROTOCOL_VERSION = 1; // goes up when a command or reply changes in a way clients must handle
+    private static string INSTRUMENT_NAME = "";
 
     private const int OPEN = 1;
     private const int CLOSE = 0;
@@ -125,9 +128,9 @@ class RemoteControl
 
         // Select the instrument: leave exactly ONE line uncommented
         // ================================================================================
-        //Instrument = ArgusMC;    DETECTOR_NAMES = Config.ARGUS_DETECTOR_NAMES;
-        //Instrument = HelixMC;    DETECTOR_NAMES = Config.HELIX_MC_DETECTOR_NAMES;
-        Instrument = HelixSFT;     DETECTOR_NAMES = Config.HELIX_SFT_DETECTOR_NAMES;
+        //Instrument = ArgusMC;    INSTRUMENT_NAME = "ArgusMC";   DETECTOR_NAMES = Config.ARGUS_DETECTOR_NAMES;
+        //Instrument = HelixMC;    INSTRUMENT_NAME = "HelixMC";   DETECTOR_NAMES = Config.HELIX_MC_DETECTOR_NAMES;
+        Instrument = HelixSFT;     INSTRUMENT_NAME = "HelixSFT";  DETECTOR_NAMES = Config.HELIX_SFT_DETECTOR_NAMES;
         // ================================================================================
 
         RegisterCommands();
@@ -263,13 +266,22 @@ class RemoteControl
 	private delegate string CommandHandler(string[] args, string rest);
 
 	// Every command is defined once, in RegisterCommands, with its arguments, reply and description.
-	// "Help", "Help <command>" and PROTOCOL.md (tools/offline_check/run.sh --update-protocol) come from these.
+	// "Help", "Describe commands", PROTOCOL.md and protocol.json (tools/offline_check/run.sh --update-protocol)
+	// all come from these definitions.
+	//
+	// Arguments are written as they appear on the wire, with a type in each <name:type>:
+	//    "<mass:number>[,<cup:text>]"   [ ] optional, the characters between arguments are the separators
+	//    "<a:text>[,<a:text>...]"       the same name twice: repeated, comma separated
+	//    types: number, integer, word (no spaces), text (may contain spaces), enum(A|B)
+	// Replies are ok, text, bool, number[:unit], list:<type>, lines (CR separated), scan, counted_scan
+	// or stream:<type>. Any command can also reply "Error: ...".
 	private class CommandInfo
 	{
 		public string Name;
 		public string Section;
 		public string Args;
-		public string Returns;
+		public string Usage; // Args without the types, for people
+		public string Reply;
 		public string Description;
 		public bool Quick; // does not touch the hardware: skips m_command_lock and answers straight away
 		public CommandHandler Handler;
@@ -286,23 +298,24 @@ class RemoteControl
 		SECTION = name;
 	}
 
-	private static void Register(string name, string args, string returns, string description, CommandHandler handler)
+	private static void Register(string name, string args, string reply, string description, CommandHandler handler)
 	{
-		Add(name, args, returns, description, handler, false);
+		Add(name, args, reply, description, handler, false);
 	}
 
-	private static void RegisterQuick(string name, string args, string returns, string description, CommandHandler handler)
+	private static void RegisterQuick(string name, string args, string reply, string description, CommandHandler handler)
 	{
-		Add(name, args, returns, description, handler, true);
+		Add(name, args, reply, description, handler, true);
 	}
 
-	private static void Add(string name, string args, string returns, string description, CommandHandler handler, bool quick)
+	private static void Add(string name, string args, string reply, string description, CommandHandler handler, bool quick)
 	{
 		CommandInfo info = new CommandInfo();
 		info.Name = name;
 		info.Section = SECTION;
 		info.Args = args;
-		info.Returns = returns;
+		info.Usage = ARG.Replace(args, delegate(Match m) { return m.Groups[3].Success ? m.Groups[3].Value : "<" + m.Groups[1].Value + ">"; });
+		info.Reply = reply;
 		info.Description = description;
 		info.Quick = quick;
 		info.Handler = handler;
@@ -326,83 +339,189 @@ class RemoteControl
 		{
 			return String.Format("Error: unknown command {0}", name);
 		}
-		return String.Format("{0}{1} -> {2}. {3}", info.Name, (info.Args.Length > 0) ? " " + info.Args : "", info.Returns, info.Description);
+		return String.Format("{0}{1} -> {2}. {3}", info.Name, (info.Usage.Length > 0) ? " " + info.Usage : "", info.Reply, info.Description);
+	}
+
+	// <name:type> or <name:enum(A|B)> in an argument definition
+	private static readonly Regex ARG = new Regex(@"<([a-z_]+):([a-z]+)(?:\(([^)]*)\))?>");
+
+	// "Describe": what a client needs to know on connecting. "Describe commands": every command definition
+	private static string Describe(string section)
+	{
+		if (section == "commands")
+		{
+			return CommandsJson();
+		}
+		if (section.Length > 0)
+		{
+			return String.Format("Error: unknown section {0}", section);
+		}
+
+		List<string> detectors = new List<string>();
+		foreach (string detname in DETECTOR_NAMES)
+		{
+			string[] p = detname.Split(',');
+			detectors.Add(String.Format("{{\"id\":{0},\"name\":{1}}}", Json(p[0]), Json(p[1])));
+		}
+		return String.Format("{{\"protocol\":{0},\"version\":{1},\"instrument\":{2},\"transport\":{3},\"tag_data\":{4},"
+			+ "\"features\":[\"keepalive\",\"subscribe\",\"request_ids\",\"scan_count\",\"describe\"],\"detectors\":[{5}]}}",
+			PROTOCOL_VERSION, Json(VERSION), Json(INSTRUMENT_NAME), Json(Config.use_udp ? "udp" : "tcp"),
+			Config.tag_data ? "true" : "false", String.Join(",", detectors.ToArray()));
+	}
+
+	private static string CommandsJson()
+	{
+		List<string> commands = new List<string>();
+		foreach (CommandInfo c in COMMAND_LIST)
+		{
+			commands.Add(String.Format("{{\"name\":{0},\"section\":{1},\"args\":[{2}],\"reply\":{3},\"hardware\":{4},\"description\":{5}}}",
+				Json(c.Name), Json(c.Section), ArgsJson(c.Args), ReplyJson(c.Reply), c.Quick ? "false" : "true", Json(c.Description)));
+		}
+		return String.Format("{{\"protocol\":{0},\"version\":{1},\"commands\":[{2}]}}",
+			PROTOCOL_VERSION, Json(VERSION), String.Join(",", commands.ToArray()));
+	}
+
+	private static string ArgsJson(string spec)
+	{
+		List<string> args = new List<string>();
+		MatchCollection matches = ARG.Matches(spec);
+		for (int i = 0; i < matches.Count; i++)
+		{
+			Match m = matches[i];
+			string name = m.Groups[1].Value;
+			if (i > 0 && matches[i-1].Groups[1].Value == name)
+			{
+				continue; // the second half of a repeated argument
+			}
+			bool repeated = i + 1 < matches.Count && matches[i+1].Groups[1].Value == name;
+			string before = spec.Substring(0, m.Index);
+			bool optional = before.LastIndexOf('[') > before.LastIndexOf(']');
+			string bare = before.TrimEnd('[');
+			string sep = (bare.Length > 0) ? bare.Substring(bare.Length - 1) : " ";
+
+			string values = "";
+			if (m.Groups[3].Success)
+			{
+				List<string> names = new List<string>();
+				foreach (string v in m.Groups[3].Value.Split('|'))
+				{
+					names.Add(Json(v));
+				}
+				values = String.Format(",\"values\":[{0}]", String.Join(",", names.ToArray()));
+			}
+			args.Add(String.Format("{{\"name\":{0},\"type\":{1}{2},\"optional\":{3},\"repeated\":{4},\"separator\":{5}}}",
+				Json(name), Json(m.Groups[2].Value), values, optional ? "true" : "false", repeated ? "true" : "false", Json(sep)));
+		}
+		return String.Join(",", args.ToArray());
+	}
+
+	private static string ReplyJson(string reply)
+	{
+		string[] p = reply.Split(':');
+		if (p.Length == 1)
+		{
+			return String.Format("{{\"type\":{0}}}", Json(p[0]));
+		}
+		return String.Format("{{\"type\":{0},{1}:{2}}}", Json(p[0]), (p[0] == "number") ? "\"unit\"" : "\"of\"", Json(p[1]));
+	}
+
+	private static string Json(string s)
+	{
+		StringBuilder sb = new StringBuilder("\"");
+		foreach (char c in s)
+		{
+			if (c == '"' || c == '\\')
+			{
+				sb.Append('\\').Append(c);
+			}
+			else if (c < ' ')
+			{
+				sb.Append(String.Format("\\u{0:x4}", (int)c));
+			}
+			else
+			{
+				sb.Append(c);
+			}
+		}
+		return sb.Append('"').ToString();
 	}
 
 	private static void RegisterCommands()
 	{
 		Section("General");
-		RegisterQuick("GetVersion", "", "<version>", "Version of this script.",
+		RegisterQuick("GetVersion", "", "text", "Version of this script.",
 			(a, rest) => VERSION);
-		RegisterQuick("Help", "[<command>]", "<command>,<command>,... | <usage>", "All command names, or the usage of one command.",
+		RegisterQuick("Help", "[<command:word>]", "text", "Comma separated command names, or the usage of one command.",
 			(a, rest) => Help(rest));
-		RegisterQuick("Ping", "", "OK", "Check that the server is answering.",
+		RegisterQuick("Describe", "[<section:enum(commands)>]", "text", "JSON on one line. No argument: protocol version, script version, instrument, transport, features, detectors. commands: every command definition (use TCP: this is several kB).",
+			(a, rest) => Describe(rest));
+		RegisterQuick("Ping", "", "ok", "Check that the server is answering.",
 			(a, rest) => "OK");
-		RegisterQuick("KeepAlive", "", "OK", "TCP only, and only as the first command on a connection: keep the connection open for newline terminated commands and replies.",
+		RegisterQuick("KeepAlive", "", "ok", "TCP only, and only as the first command on a connection: keep the connection open. Commands end in CR, LF or CRLF; replies end in LF.",
 			(a, rest) => "Error: KeepAlive must be the first command on a TCP connection");
-		Register("GetTuningSettingsList", "", "<name>,<name>,...", "Saved tune settings.",
+		Register("GetTuningSettingsList", "", "list:text", "Saved tune settings.",
 			(a, rest) => GetTuningSettings());
-		Register("SetTuningSettings", "<name>", "OK | Error", "Load a saved tune setting.",
+		Register("SetTuningSettings", "<name:word>", "ok", "Load a saved tune setting.",
 			(a, rest) => SetTuningSettings(a[1]) ? "OK" : String.Format("Error: could not set tuning settings {0}", a[1]));
-		Register("GetIntegrationTime", "", "<seconds>", "Integration time of the monitor scan.",
+		Register("GetIntegrationTime", "", "number:s", "Integration time of the monitor scan.",
 			(a, rest) => GetIntegrationTime());
-		Register("SetIntegrationTime", "<seconds>", "OK | Error", "Restart the monitor scan with a new integration time.",
+		Register("SetIntegrationTime", "<seconds:number>", "ok", "Restart the monitor scan with a new integration time.",
 			(a, rest) => SetIntegrationTime(ToDouble(a[1])));
-		Register("BlankBeam", "true | false", "OK | Error", "true remembers Y-Symmetry and sets it to -50, false restores it. Does nothing when Config.use_beam_blank is false.",
+		Register("BlankBeam", "<blank:enum(true|false)>", "ok", "true remembers Y-Symmetry and sets it to -50, false restores it. Does nothing when Config.use_beam_blank is false.",
 			(a, rest) => BlankBeam(a[1]));
 
 		Section("Scan data");
-		RegisterQuick("GetData", "", "<name>,<value>,... | <value>,...", "Latest scan. Name,value pairs when Config.tag_data is true, values only when false. \"Error: no data\" before the first scan.",
+		RegisterQuick("GetData", "", "scan", "Latest scan. Name,value pairs when Config.tag_data is true, values only when false. \"Error: no data\" before the first scan.",
 			(a, rest) => SCAN_DATA ?? "Error: no data");
-		RegisterQuick("GetDataN", "", "<scan count>|<data>", "Latest scan with its scan count, which goes up by one for every scan. <data> is as for GetData.",
+		RegisterQuick("GetDataN", "", "counted_scan", "Latest scan with its scan count, which goes up by one for every scan. <data> is as for GetData.",
 			(a, rest) => GetDataN());
-		RegisterQuick("GetNextData", "[<timeout s>] [<scan count>]", "<scan count>|<data> | Error: timeout", "Wait for a scan newer than <scan count> (default: the latest scan now). Timeout defaults to 5 s. Over UDP this holds up other commands while it waits.",
+		RegisterQuick("GetNextData", "[<timeout_s:number>] [<scan_count:integer>]", "counted_scan", "Wait for a scan newer than <scan count> (default: the latest scan now). Timeout defaults to 5 s. Over UDP this holds up other commands while it waits.",
 			(a, rest) => GetNextData(a));
-		RegisterQuick("Subscribe", "", "<scan count>|<data> per scan", "TCP only: the server writes one line per scan until the client disconnects. Allowed as the first command or after KeepAlive.",
+		RegisterQuick("Subscribe", "", "stream:counted_scan", "TCP only: the server writes one line per scan until the client disconnects. Allowed as the first command or after KeepAlive.",
 			(a, rest) => "Error: Subscribe needs a TCP connection");
-		RegisterQuick("ProbeScanData", "", "OK", "Diagnostic: log the structure of the next scan to the Qtegra log.",
+		RegisterQuick("ProbeScanData", "", "ok", "Diagnostic: log the structure of the next scan to the Qtegra log.",
 			(a, rest) => { PROBE_PENDING=true; return "OK"; });
 
 		Section("Cup and sub cup configurations");
-		Register("GetCupConfigurationList", "", "<name>\\r<name>...", "Cup configuration names, separated by carriage returns.",
+		Register("GetCupConfigurationList", "", "lines", "Cup configuration names, separated by carriage returns.",
 			(a, rest) => string.Join("\r", GetCupConfigurations().ToArray()));
-		Register("GetSubCupConfigurationList", "<cup name>", "<name>\\r<name>...", "Sub cup configuration names of a cup configuration.",
+		Register("GetSubCupConfigurationList", "<cup:word>", "lines", "Sub cup configuration names of a cup configuration.",
 			(a, rest) => GetSubCupConfigurationList(a[1]));
-		Register("GetActiveCupConfiguration", "", "<name>", "",
+		Register("GetActiveCupConfiguration", "", "text", "",
 			(a, rest) => Instrument.CupConfigurationDataList.GetActiveCupConfiguration().Name);
-		Register("GetActiveSubCupConfiguration", "", "<name>", "",
+		Register("GetActiveSubCupConfiguration", "", "text", "",
 			(a, rest) => Instrument.CupConfigurationDataList.GetActiveSubCupConfiguration().Name);
-		Register("GetSubCupParameters", "", "<parameter>,<value>;...", "Deflection of each detector of the selected instrument, then CDD Supply Set. Unreadable parameters are left out.",
+		Register("GetSubCupParameters", "", "text", "parameter,value;parameter,value...: the deflection of each detector of the selected instrument, then CDD Supply Set. Unreadable parameters are left out.",
 			(a, rest) => GetSubCupParameters());
-		Register("ActivateCupConfiguration", "<cup name> <sub cup name>", "OK | Error", "Names cannot contain spaces.",
+		Register("ActivateCupConfiguration", "<cup:word> <sub_cup:word>", "ok", "Names cannot contain spaces.",
 			(a, rest) => mActivateCup(a[1], a[2]));
 
 		Section("Ion counters (CDD)");
-		Register("ActivateIonCounter", "<detector>", "OK | Error", "Activate and unprotect one CDD, then restart the monitor scan.",
+		Register("ActivateIonCounter", "<detector:word>", "ok", "Activate and unprotect one CDD, then restart the monitor scan.",
 			(a, rest) => SetIonCounterState(a[1], true));
-		Register("DeactivateIonCounter", "<detector>", "OK | Error", "Deactivate and protect one CDD, then restart the monitor scan.",
+		Register("DeactivateIonCounter", "<detector:word>", "ok", "Deactivate and protect one CDD, then restart the monitor scan.",
 			(a, rest) => SetIonCounterState(a[1], false));
-		Register("ActivateAllCDDs", "", "OK | Error", "Activate and unprotect every CDD with a mass in the active cup configuration.",
+		Register("ActivateAllCDDs", "", "ok", "Activate and unprotect every CDD with a mass in the active cup configuration.",
 			(a, rest) => ActivateAllCDDs());
-		Register("DeactivateAllCDDs", "", "OK | Error", "Deactivate and protect all CDDs.",
+		Register("DeactivateAllCDDs", "", "ok", "Deactivate and protect all CDDs.",
 			(a, rest) => DeactivateAllCDDs());
 
 		Section("Valves");
-		Register("Open", "<valve>", "OK | Error", "Set the valve parameter to 1, e.g. Open Valve Ion Pump Set.",
+		Register("Open", "<valve:text>", "ok", "Set the valve parameter to 1, e.g. Open Valve Ion Pump Set.",
 			(a, rest) => SetParameter(rest, OPEN));
-		Register("Close", "<valve>", "OK | Error", "Set the valve parameter to 0.",
+		Register("Close", "<valve:text>", "ok", "Set the valve parameter to 0.",
 			(a, rest) => SetParameter(rest, CLOSE));
-		Register("GetValveState", "<valve>", "True | False | Error", "True when open.",
+		Register("GetValveState", "<valve:text>", "bool", "True when open.",
 			(a, rest) => GetValveState(rest));
 
 		Section("Magnet");
-		Register("GetMagnetDAC", "", "<value>", "Field Set, 0-10 V.",
+		Register("GetMagnetDAC", "", "number:V", "Field Set, 0-10 V.",
 			(a, rest) => ReadParameter("Field Set", 1));
-		Register("SetMagnetDAC", "<value>", "OK | Error", "Set Field Set, 0-10 V. Moves larger than Config.magnet_move_threshold are stepped in the background: poll GetMagnetMoving.",
+		Register("SetMagnetDAC", "<dac:number>", "ok", "Set Field Set, 0-10 V. Moves larger than Config.magnet_move_threshold are stepped in the background: poll GetMagnetMoving.",
 			(a, rest) => SetMagnetDAC(ToDouble(a[1])));
-		RegisterQuick("GetMagnetMoving", "", "True | False", "True while a SetMagnetDAC or SetMass move is running.",
+		RegisterQuick("GetMagnetMoving", "", "bool", "True while a SetMagnetDAC or SetMass move is running.",
 			(a, rest) => GetMagnetMoving());
-		Register("SetMass", "<mass>[,<cup>]", "OK | Error", "Put <mass> on <cup> (default AX). Deactivates the CDDs first; large moves are stepped.",
+		Register("SetMass", "<mass:number>[,<cup:text>]", "ok", "Put <mass> on <cup> (default AX). Deactivates the CDDs first; large moves are stepped.",
 			(a, rest) =>
 			{
 				//Adapted from CSIRORemoteControlServer.cs
@@ -411,40 +530,40 @@ class RemoteControl
 			});
 
 		Section("Source");
-		Register("GetHighVoltage", "", "<V>", "Acceleration Reference Set in V.",
+		Register("GetHighVoltage", "", "number:V", "Acceleration Reference Set in V.",
 			(a, rest) => ReadParameter("Acceleration Reference Set", 1000));
-		Register("SetHighVoltage", "<V>", "OK | Error", "",
+		Register("SetHighVoltage", "<volts:number>", "ok", "",
 			(a, rest) => SetParameter("Acceleration Reference Set", ToDouble(a[1])/1000.0));
-		Register("GetHV", "", "<kV>", "Acceleration Reference Set in kV. Note: SetHV takes V.",
+		Register("GetHV", "", "number:kV", "Acceleration Reference Set in kV. Note: SetHV takes V.",
 			(a, rest) => ReadParameter("Acceleration Reference Set", 1));
-		Register("SetHV", "<V>", "OK | Error", "Same as SetHighVoltage. Note: takes V although GetHV returns kV.",
+		Register("SetHV", "<volts:number>", "ok", "Same as SetHighVoltage. Note: takes V although GetHV returns kV.",
 			(a, rest) => SetParameter("Acceleration Reference Set", ToDouble(a[1])/1000.0));
 
 		Section("Detectors");
-		Register("ProtectDetector", "<detector>,On | Off", "OK", "On saves the deflection and sets it to 2000, Off restores it.",
+		Register("ProtectDetector", "<detector:word>,<state:enum(On|Off)>", "ok", "On saves the deflection and sets it to 2000, Off restores it.",
 			(a, rest) =>
 			{
 				string[] p = a[1].Split(',');
 				ProtectDetector(p[0], p[1]);
 				return "OK";
 			});
-		Register("GetDeflection", "<detector>", "<value> | Error", "Deflection <detector> Set.",
+		Register("GetDeflection", "<detector:text>", "number", "Deflection <detector> Set.",
 			(a, rest) => ReadParameter(String.Format("Deflection {0} Set", rest), 1));
-		Register("SetDeflection", "<detector>,<value>", "OK | Error", "",
+		Register("SetDeflection", "<detector:text>,<value:number>", "ok", "",
 			(a, rest) =>
 			{
 				string[] p = rest.Split(',');
 				return SetParameter(String.Format("Deflection {0} Set", p[0]), ToDouble(p[1]));
 			});
-		Register("GetDeflections", "<detector>[,<detector>...]", "<value>,<value>,...", "0 for a deflection that cannot be read.",
+		Register("GetDeflections", "<detector:text>[,<detector:text>...]", "list:number", "0 for a deflection that cannot be read.",
 			(a, rest) => GetDeflections(a));
-		Register("GetIonCounterVoltage", "", "<value> | Error", "CDD Supply Set.",
+		Register("GetIonCounterVoltage", "", "number", "CDD Supply Set.",
 			(a, rest) => ReadParameter("CDD Supply Set", 1));
-		Register("SetIonCounterVoltage", "<value>", "OK | Error", "",
+		Register("SetIonCounterVoltage", "<value:number>", "ok", "",
 			(a, rest) => SetParameter("CDD Supply Set", ToDouble(a[1])));
-		Register("GetGain", "<detector>", "<value> | Error", "Detector gain from the calibration data.",
+		Register("GetGain", "<detector:text>", "number", "Detector gain from the calibration data.",
 			(a, rest) => GetGain(rest));
-		Register("SetGain", "<detector>,<value>", "OK | Error", "",
+		Register("SetGain", "<detector:text>,<value:number>", "ok", "",
 			(a, rest) =>
 			{
 				string[] p = rest.Split(',');
@@ -452,19 +571,19 @@ class RemoteControl
 			});
 
 		Section("Hardware parameters");
-		Register("GetParameter", "<parameter>", "<value> | Error", "Any item in the instrument's hardware database, e.g. Field Set. See \"Finding parameter names\".",
+		Register("GetParameter", "<parameter:text>", "number", "Any item in the instrument's hardware database, e.g. Field Set. See \"Finding parameter names\".",
 			(a, rest) => ReadParameter(rest, 1));
-		Register("SetParameter", "<parameter>,<value>", "OK | Error", "",
+		Register("SetParameter", "<parameter:text>,<value:number>", "ok", "",
 			(a, rest) =>
 			{
 				string[] p = rest.Split(',');
 				return SetParameter(p[0], ToDouble(p[1]));
 			});
-		Register("GetParameters", "<parameter>[,<parameter>...]", "<value>,<value>,...", "0 for a parameter that cannot be read: use CheckParameters to tell.",
+		Register("GetParameters", "<parameter:text>[,<parameter:text>...]", "list:number", "0 for a parameter that cannot be read: use CheckParameters to tell.",
 			(a, rest) => GetParameters(rest));
-		Register("CheckParameters", "<parameter>[,<parameter>...]", "True | False,...", "True for each parameter that can be read.",
+		Register("CheckParameters", "<parameter:text>[,<parameter:text>...]", "list:bool", "True for each parameter that can be read.",
 			(a, rest) => CheckParameters(rest));
-		Register("ProbeInstrument", "", "OK", "Diagnostic: log the instrument object's properties and members to the Qtegra log, to look for a list of its parameters.",
+		Register("ProbeInstrument", "", "ok", "Diagnostic: log the instrument object's properties and members to the Qtegra log, to look for a list of its parameters.",
 			(a, rest) => ProbeInstrument());
 	}
 
@@ -1531,7 +1650,7 @@ class RemoteControl
 
     // A connection handles one command and is closed after the reply, as clients have always used it,
     // unless the first command is
-    //    KeepAlive  - reply "OK\n", then handle newline terminated commands, each answered with reply + "\n",
+    //    KeepAlive  - reply "OK\n", then handle commands ending in CR, LF or CRLF, each answered with reply + "\n",
     //                 until the client disconnects or is idle for Config.tcp_idle_timeout ms
     //    Subscribe  - write "<scan count>|<data>\n" for every scan until the client disconnects
     private static void TCPHandle (TcpClient tcpClient)
@@ -1553,7 +1672,7 @@ class RemoteControl
                 return;
             }
 
-            int nl = first.IndexOf('\n');
+            int nl = first.IndexOfAny(LINE_ENDS);
             string firstcmd = ((nl < 0) ? first : first.Substring(0, nl)).Trim();
             if (firstcmd == "KeepAlive")
             {
@@ -1661,14 +1780,17 @@ class RemoteControl
         return myCompleteMessage.ToString ();
     }
 
-    // next newline terminated line, using buffer for data already received. null if the client closed the connection
+    // CR, LF and CRLF all end a command. the empty line left by CRLF is skipped by the caller
+    private static readonly char[] LINE_ENDS = new char[]{'\r', '\n'};
+
+    // next line, using buffer for data already received. null if the client closed the connection
     private static string TCPReadLine (NetworkStream stream, StringBuilder buffer)
     {
         byte[] data = new byte[1024];
         while (true)
         {
             string pending = buffer.ToString();
-            int nl = pending.IndexOf('\n');
+            int nl = pending.IndexOfAny(LINE_ENDS);
             if (nl >= 0)
             {
                 buffer.Remove(0, nl + 1);

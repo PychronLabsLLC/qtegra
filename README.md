@@ -19,6 +19,7 @@ Files
 =====
     RemoteControlServer.cs          the server script, run inside Qtegra
     PROTOCOL.md                     protocol and command reference (generated)
+    protocol.json                   the same commands, machine-readable (generated)
     RemoteControlServerChanges.txt  change log
     CSIRORemoteControlServer.cs     fork maintained by CSIRO (Suckow, Deslandes, Gerber)
     SampleFunctionScript.cs,
@@ -66,7 +67,10 @@ Protocol
 ========
 See PROTOCOL.md: message format, request ids, UDP and TCP (KeepAlive,
 Subscribe), error replies, every command, and how to find hardware parameter
-names. A running server also answers "Help" and "Help <command>".
+names. A running server also answers "Help", "Help <command>" and "Describe".
+
+Clients can keep a copy of protocol.json and test against it, so a command the
+server does not have is caught without an instrument.
 
 Diagnostics
 ===========
@@ -86,7 +90,7 @@ Without Qtegra (needs the .NET SDK):
     tools/offline_check/run.sh
 
 This compiles RemoteControlServer.cs as C# 4 against stand-ins for the Thermo
-types, checks PROTOCOL.md is up to date, then runs commands, request ids, scan
+types, checks PROTOCOL.md and protocol.json are up to date, then runs commands, request ids, scan
 data and the UDP and TCP servers with a fake instrument. The stand-ins are guessed from how the script uses the
 Thermo API, so passing here does not guarantee the script compiles in Qtegra.
 
@@ -99,16 +103,19 @@ Adding commands
 ===============
 Register the command in RegisterCommands(), under the right Section(...):
 
-    Register("GetFoo", "", "<value> | Error", "Foo Set, in V.",
+    Register("GetFoo", "", "number:V", "Foo Set.",
         (a, rest) => ReadParameter("Foo Set", 1));
+    Register("SetFoo", "<channel:word>,<value:number>", "ok", "",
+        (a, rest) => ...);
 
-The arguments are: name, arguments, reply, description, handler. Use
+The arguments are: name, arguments, reply, description, handler. The comment
+above RegisterCommands lists the argument syntax and reply types. Use
 RegisterQuick for commands that do not touch the hardware. In the handler, a is
 the command split on spaces (a[0] is the command name) and rest is everything
 after the command name. Return a value, "OK" or "Error: ...". Missing arguments
 and bad numbers are turned into error replies for you.
 
-Then regenerate the docs:
+Then regenerate PROTOCOL.md and protocol.json:
 
     tools/offline_check/run.sh --update-protocol
 

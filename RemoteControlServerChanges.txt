@@ -60,6 +60,9 @@ protocol
     is replaced by PROTOCOL.md
     added CheckParameters and ProbeInstrument for finding parameter names;
     GetParameters accepts names with spaces
+    added Describe and Describe commands (JSON), a protocol version, and a
+    generated protocol.json; command arguments and replies are typed
+    KeepAlive connections accept CR, LF or CRLF after each command
     commands are registered in a table (RegisterCommands) instead of a switch
     GetSubCupParameters follows the selected instrument's detectors
 

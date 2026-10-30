@@ -92,6 +92,8 @@ class RemoteControl
     private static bool IsBLANKED=false;
     private static Dictionary<string, double> m_defl = new Dictionary<string, double>();
 
+    private const string VERSION = "20.2"; // keep in sync with __version__ in the header
+
     private const int OPEN = 1;
     private const int CLOSE = 0;
 
@@ -112,17 +114,14 @@ class RemoteControl
     public static void Main ()
     {
 
-        // Configure the proper instrument
+        // Select the instrument: leave exactly ONE line uncommented
         // ================================================================================
-        //Instrument= ArgusMC;
-        //DETECTOR_NAMES = Config.ARGUS_DETECTOR_NAMES
-
-        //Instrument= HelixMC;
-        //DETECTOR_NAMES = Config.HELIX_MC_DETECTOR_NAMES
+        //Instrument = ArgusMC;    DETECTOR_NAMES = Config.ARGUS_DETECTOR_NAMES;
+        //Instrument = HelixMC;    DETECTOR_NAMES = Config.HELIX_MC_DETECTOR_NAMES;
+        Instrument = HelixSFT;     DETECTOR_NAMES = Config.HELIX_SFT_DETECTOR_NAMES;
         // ================================================================================
 
-        Instrument= HelixSFT;
-        DETECTOR_NAMES = Config.HELIX_SFT_DETECTOR_NAMES;
+        RegisterCommands();
 
         //init parameters
         Instrument.GetParameter("Y-Symmetry Set", out LAST_Y_SYMMETRY);
@@ -155,8 +154,10 @@ class RemoteControl
     //  do not include the "<" or ">" in the commands.
     //  e.g SetTrapVoltage 120 not SetTrapVoltage <120>
     //  Commands:
+    //      GetVersion #version of this script
+    //      Help #comma separated list of all commands
     //      GetTuningSettingsList #return a comma separated string
-    //      SetTuningSettings
+    //      SetTuningSettings <name>
     //      GetData returns tagged data e.g. H2,aaa,L1,bbb,CDD,ccc
     //      ProbeScanData #log the structure of the next scan to the Qtegra log (diagnostic)
     //      SetIntegrationTime <seconds>
@@ -165,11 +166,10 @@ class RemoteControl
 
     //===========Cup/SubCup Configurations==============================
     //      GetCupConfigurationList
-    //      GetSubCupConfigurationList
+    //      GetSubCupConfigurationList <cup name>
     //      GetActiveCupConfiguration
     //      GetActiveSubCupConfiguration
     //      GetSubCupParameters returns list of Deflection voltages and the Ion Counter supply voltage
-    //      SetSubCupConfiguration <sub cup name>
     //      ActivateCupConfiguration <cup name> <sub cup name>
 
     //===========Ion Counter============================================
@@ -177,15 +177,21 @@ class RemoteControl
     //      DeactivateIonCounter <detname>
 
     //===========Ion Pump Valve=========================================
-    //      Open  #open the Ion pump to the mass spec
-    //      Close #closes the Ion pump to the mass spec
-    //      GetValveState #returns True for open false for close
+    //      Open <name>  #open the Ion pump to the mass spec
+    //      Close <name> #closes the Ion pump to the mass spec
+    //      GetValveState <name> #returns True for open false for close
 
     //===========Magnet=================================================
     //      GetMagnetDAC
     //      SetMagnetDAC <value> #0-10V
     //      GetMagnetMoving
     //      @SetMass <value>,<string cupName> #deactivates the CDDs if they are active
+
+    //===========Source=================================================
+    //      GetHighVoltage #V
+    //      SetHighVoltage <V>
+    //      GetHV #kV
+    //      SetHV <V>  NOTE: GetHV returns kV but SetHV takes V
 
     //==========Detectors===============================================
     //      @ActivateAllCDDs #activates and unprotects all CDDs with a mass in the CupConfiguration
@@ -196,12 +202,15 @@ class RemoteControl
 	//      GetIonCounterVoltage
 	//      SetIonCounterVoltage <value>
 	//      GetGain <name>
+	//      SetGain <name>,<value>
 	//      GetDeflections <name>[,<name>,...]
 
 	//==================================================================
 	//		Error Responses:
 	//			Error: Invalid Command   - the command is poorly formated or does not exist.
 	//			Error: could not set <hardware> to <value>
+	//			Error: could not read <hardware>
+	//			Error: missing argument for <cmd> / Error: invalid number in <cmd>
 
      //==========Generic Device===============================================
 	//      GetParameter <name> -  name is any valid device currently listed in the hardware database
@@ -212,7 +221,7 @@ class RemoteControl
 	private static string ParseAndExecuteCommand (string cmd)
 	{
 		string result;
-		Logger.Log(LogLevel.UserInfo, String.Format("Executing {0}", cmd));
+		Logger.Log(LogLevel.Debug, String.Format("Executing {0}", cmd));
 		try
 		{
 			result = ExecuteCommand(cmd);
@@ -239,263 +248,148 @@ class RemoteControl
 		return result;
 	}
 
+	// args: the command split on spaces, args[0] is the command name
+	// rest: everything after the command name, rejoined with single spaces
+	private delegate string CommandHandler(string[] args, string rest);
+
+	private static Dictionary<string, CommandHandler> COMMANDS = new Dictionary<string, CommandHandler>();
+	private static List<string> COMMAND_NAMES = new List<string>();
+
+	private static void Register(string name, CommandHandler handler)
+	{
+		COMMANDS[name] = handler;
+		COMMAND_NAMES.Add(name);
+	}
+
+	private static void RegisterCommands()
+	{
+		Register("GetVersion", (a, rest) => VERSION);
+		Register("Help", (a, rest) => String.Join(",", COMMAND_NAMES.ToArray()));
+
+		Register("GetTuningSettingsList", (a, rest) => GetTuningSettings());
+		Register("SetTuningSettings", (a, rest) => SetTuningSettings(a[1]) ? "OK" : String.Format("Error: could not set tuning settings {0}", a[1]));
+		Register("GetData", (a, rest) => SCAN_DATA ?? "Error: no data");
+		Register("ProbeScanData", (a, rest) => { PROBE_PENDING=true; return "OK"; });
+		Register("SetIntegrationTime", (a, rest) => SetIntegrationTime(ToDouble(a[1])));
+		Register("GetIntegrationTime", (a, rest) => GetIntegrationTime());
+		Register("BlankBeam", (a, rest) => BlankBeam(a[1]));
+
+		// Cup / SubCup Configurations
+		Register("GetCupConfigurationList", (a, rest) => string.Join("\r", GetCupConfigurations().ToArray()));
+		Register("GetSubCupConfigurationList", (a, rest) => GetSubCupConfigurationList(a[1]));
+		Register("GetActiveCupConfiguration", (a, rest) => Instrument.CupConfigurationDataList.GetActiveCupConfiguration().Name);
+		Register("GetActiveSubCupConfiguration", (a, rest) => Instrument.CupConfigurationDataList.GetActiveSubCupConfiguration().Name);
+		Register("GetSubCupParameters", (a, rest) => GetSubCupParameters());
+		Register("ActivateCupConfiguration", (a, rest) => mActivateCup(a[1], a[2]));
+
+		// Ion Counter
+		Register("ActivateIonCounter", (a, rest) => SetIonCounterState(a[1], true));
+		Register("DeactivateIonCounter", (a, rest) => SetIonCounterState(a[1], false));
+
+		// Ion Pump Valve
+		Register("Open", (a, rest) => SetParameter(rest, OPEN));
+		Register("Close", (a, rest) => SetParameter(rest, CLOSE));
+		Register("GetValveState", (a, rest) => GetValveState(rest));
+
+		// Magnet
+		Register("GetMagnetDAC", (a, rest) => ReadParameter("Field Set", 1));
+		Register("SetMagnetDAC", (a, rest) => SetMagnetDAC(ToDouble(a[1])));
+		Register("GetMagnetMoving", (a, rest) => GetMagnetMoving());
+		Register("SetMass", (a, rest) =>
+		{
+			//Adapted from CSIRORemoteControlServer.cs
+			string[] p = rest.Split(',');
+			return SetMass(ToDouble(p[0]), (p.Length>1) ? p[1] : null);
+		});
+
+		// Source Parameters
+		Register("GetHighVoltage", (a, rest) => ReadParameter("Acceleration Reference Set", 1000));
+		Register("SetHighVoltage", (a, rest) => SetParameter("Acceleration Reference Set", ToDouble(a[1])/1000.0));
+		Register("GetHV", (a, rest) => ReadParameter("Acceleration Reference Set", 1));
+		Register("SetHV", (a, rest) => SetParameter("Acceleration Reference Set", ToDouble(a[1])/1000.0));
+
+		// Detectors
+		Register("ProtectDetector", (a, rest) =>
+		{
+			string[] p = a[1].Split(',');
+			ProtectDetector(p[0], p[1]);
+			return "OK";
+		});
+		Register("GetDeflection", (a, rest) => ReadParameter(String.Format("Deflection {0} Set", rest), 1));
+		Register("SetDeflection", (a, rest) =>
+		{
+			string[] p = rest.Split(',');
+			return SetParameter(String.Format("Deflection {0} Set", p[0]), ToDouble(p[1]));
+		});
+		Register("GetDeflections", (a, rest) => GetDeflections(a));
+		Register("GetIonCounterVoltage", (a, rest) => ReadParameter("CDD Supply Set", 1));
+		Register("SetIonCounterVoltage", (a, rest) => SetParameter("CDD Supply Set", ToDouble(a[1])));
+		Register("GetGain", (a, rest) => GetGain(rest));
+		Register("SetGain", (a, rest) =>
+		{
+			string[] p = rest.Split(',');
+			return SetGain(p[0], ToDouble(p[1]));
+		});
+		Register("ActivateAllCDDs", (a, rest) => ActivateAllCDDs());
+		Register("DeactivateAllCDDs", (a, rest) => DeactivateAllCDDs());
+
+		// Generic
+		Register("GetParameter", (a, rest) => ReadParameter(rest, 1));
+		Register("SetParameter", (a, rest) =>
+		{
+			string[] p = rest.Split(',');
+			return SetParameter(p[0], ToDouble(p[1]));
+		});
+		Register("GetParameters", (a, rest) => GetParameters(a));
+	}
+
 	private static string ExecuteCommand (string cmd)
 	{
-
-		string result = "Error: Invalid Command";
-
 		string[] args = cmd.Trim().Split (new char[]{' '}, StringSplitOptions.RemoveEmptyEntries);
-		if (args.Length == 0)
+		CommandHandler handler;
+		if (args.Length == 0 || !COMMANDS.TryGetValue(args[0], out handler))
 		{
-			return result;
+			return "Error: Invalid Command";
 		}
-		string[] pargs;
-		string jargs;
+		string rest = String.Join(" ", Slice(args, 1, 0));
+		return handler(args, rest);
+	}
 
-        switch (args[0]) {
-
-        case "GetDeflections":
-            result = GetDeflections(args);
-            break;
-        case "GetParameters":
-            result = GetParameters(args);
-            break;
-
-		case "GetTuningSettingsList":
-			result = GetTuningSettings();
-			break;
-
-		case "SetTuningSettings":
-			if(SetTuningSettings(args[1]))
-			{
-				result="OK";
-			}
-			else
-			{
-				result=String.Format("Error: could not set tuning settings {0}",args[1]);
-			}
-			break;
-
-		case "GetData":
-			result=SCAN_DATA ?? "Error: no data";
-			break;
-
-		case "ProbeScanData":
-			// log the structure of the next scan received. diagnostic only
-			PROBE_PENDING=true;
-			result="OK";
-			break;
-
-		case "SetIntegrationTime":
-			result=SetIntegrationTime(ToDouble(args[1]));
-			break;
-		case "GetIntegrationTime":
-			result=GetIntegrationTime();
-			break;
-
-		case "BlankBeam":
-
-			if (!Config.use_beam_blank)
-			{
-				result="OK";
-				break;
-			}
-
-			double yval=LAST_Y_SYMMETRY;
-			bool blankbeam=false;
-			if (args[1].ToLower()=="true")
-			{
-				if(!IsBLANKED)
-				{
-					//remember the non blanking Y-Symmetry value
-					Instrument.GetParameter("Y-Symmetry Set", out LAST_Y_SYMMETRY);
-					yval=-50;
-					IsBLANKED=true;
-					blankbeam=true;
-				}
-			}
-			else
-			{
-				if(IsBLANKED)
-				{
-					IsBLANKED=false;
-					blankbeam=true;
-					result=SetParameter("Y-Symmetry Set",yval);
-				}
-			}
-
-			result="OK";
-			if(blankbeam)
-			{
-				result=SetParameter("Y-Symmetry Set",yval);
-			}
-
-			break;
-
-//============================================================================================
-//   Cup / SubCup Configurations
-//============================================================================================
-        case "GetCupConfigurationList":
-            List<string> cup_names = GetCupConfigurations ();
-            result = string.Join ("\r", cup_names.ToArray ());
-            break;
-
-        case "GetSubCupConfigurationList":
-            string config_name = args[1];
-            List<string> sub_names = GetSubCupConfigurations (config_name);
-            if (sub_names == null)
-            {
-                result = String.Format("Error: could not find cup configuration {0}", config_name);
-                break;
-            }
-            result = string.Join ("\r", sub_names.ToArray ());
-            break;
-
-        case "GetActiveCupConfiguration":
-            result=Instrument.CupConfigurationDataList.GetActiveCupConfiguration().Name;
-            break;
-
-        case "GetActiveSubCupConfiguration":
-            result=Instrument.CupConfigurationDataList.GetActiveSubCupConfiguration().Name;
-            break;
-
-        case "GetSubCupParameters":
-            result=GetSubCupParameters();
-            break;
-
-        case "ActivateCupConfiguration":
-            result = mActivateCup(args[1], args[2]);
-            break;
-//============================================================================================
-//   Ion Counter
-//============================================================================================
-		case "ActivateIonCounter":
-			result = SetIonCounterState(args[1], true);
-			break;
-		case "DeactivateIonCounter":
-			result = SetIonCounterState(args[1], false);
-			break;
-
-//============================================================================================
-//   Ion Pump Valve
-//============================================================================================
-        case "Open":
-        	Logger.Log(LogLevel.Debug, String.Format("Executing {0}", cmd));
-			jargs=String.Join(" ", Slice(args,1,0));
-			result=SetParameter(jargs,OPEN);
-			break;
-
-		case "Close":
-			jargs=String.Join(" ", Slice(args,1,0));
-			Logger.Log(LogLevel.Debug, String.Format("Executing {0}", cmd));
-			result=SetParameter(jargs,CLOSE);
-			break;
-
-		case "GetValveState":
-			Logger.Log(LogLevel.Debug, String.Format("Executing {0}", cmd));
-
-			jargs=String.Join(" ", Slice(args,1,0));
-			result=GetValveState(jargs);
-			Logger.Log(LogLevel.Debug, String.Format("Valve state {0}", result));
-			break;
-
-//============================================================================================
-//   Magnet
-//============================================================================================
-        case "GetMagnetDAC":
-            result=ReadParameter("Field Set", 1);
-            break;
-
-        case "SetMagnetDAC":
-            result=SetMagnetDAC(ToDouble(args[1]));
-            break;
-        case "GetMagnetMoving":
-            result=GetMagnetMoving();
-            break;
-        case "SetMass":
-            //Adapted from CSIRORemoteControlServer.cs
-			jargs=String.Join(" ", Slice(args,1,0));
-            pargs=jargs.Split(',');
-		   result = SetMass(ToDouble(pargs[0]),(pargs.Length>1) ? pargs[1] : null);
-            break;
-//============================================================================================
-//    Source Parameters
-//============================================================================================
-		case "GetHighVoltage":
-			result=ReadParameter("Acceleration Reference Set", 1000);
-			break;
-
-		case "SetHighVoltage":
-			result=SetParameter("Acceleration Reference Set", ToDouble(args[1])/1000.0);
-			break;
-		case "GetHV":
-			result=ReadParameter("Acceleration Reference Set", 1);
-			break;
-
-		case "SetHV":
-			result=SetParameter("Acceleration Reference Set", ToDouble(args[1])/1000.0);
-			break;
-//============================================================================================
-//    Detectors
-//============================================================================================
-        case "ProtectDetector":
-            pargs=args[1].Split(',');
-            ProtectDetector(pargs[0], pargs[1]);
-            result="OK";
-            break;
-
-        case "GetDeflection":
-            jargs=String.Join(" ", Slice(args,1,0));
-            result=ReadParameter(String.Format("Deflection {0} Set",jargs), 1);
-            break;
-
-        case "SetDeflection":
-            jargs=String.Join(" ", Slice(args,1,0));
-            pargs=jargs.Split(',');
-            result=SetParameter(String.Format("Deflection {0} Set",pargs[0]),ToDouble(pargs[1]));
-            break;
-
-        case "GetIonCounterVoltage":
-            result=ReadParameter("CDD Supply Set", 1);
-            break;
-
-        case "SetIonCounterVoltage":
-            result=SetParameter("CDD Supply Set", ToDouble(args[1]));
-            break;
-
-        case "GetGain":
-            jargs=String.Join(" ", Slice(args,1,0));
-            result=GetGain(jargs);
-            break;
-
-        case "SetGain":
-            jargs=String.Join(" ", Slice(args,1,0));
-            pargs=jargs.Split(',');
-            result=SetGain(pargs[0], ToDouble(pargs[1]));
-            break;
-
-        case "ActivateAllCDDs":
-		    result = ActivateAllCDDs();
-			break;
-
-		case "DeactivateAllCDDs":
-		    result = DeactivateAllCDDs();
-			break;
-//============================================================================================
-//    Generic
-//============================================================================================
-		case "GetParameter":
-		    jargs=String.Join(" ", Slice(args,1,0));
-			result=ReadParameter(jargs, 1);
-			break;
-
-		case "SetParameter":
-		    jargs=String.Join(" ", Slice(args,1,0));
-            pargs=jargs.Split(',');
-		  result=SetParameter(pargs[0], ToDouble(pargs[1]));
-		  break;
+	private static string BlankBeam(string arg)
+	{
+		if (!Config.use_beam_blank)
+		{
+			return "OK";
 		}
-		return result;
+
+		if (arg.ToLower()=="true")
+		{
+			if (IsBLANKED)
+			{
+				return "OK";
+			}
+			//remember the non blanking Y-Symmetry value
+			Instrument.GetParameter("Y-Symmetry Set", out LAST_Y_SYMMETRY);
+			IsBLANKED=true;
+			return SetParameter("Y-Symmetry Set", -50.0);
+		}
+
+		if (!IsBLANKED)
+		{
+			return "OK";
+		}
+		IsBLANKED=false;
+		return SetParameter("Y-Symmetry Set", LAST_Y_SYMMETRY);
+	}
+
+	private static string GetSubCupConfigurationList(string config_name)
+	{
+		List<string> sub_names = GetSubCupConfigurations (config_name);
+		if (sub_names == null)
+		{
+			return String.Format("Error: could not find cup configuration {0}", config_name);
+		}
+		return string.Join ("\r", sub_names.ToArray ());
 	}
 //============================================================================================
 //    EOCommands
@@ -1236,24 +1130,21 @@ class RemoteControl
 
 	private static string GetSubCupParameters()
 	{
-	  // change parameters to values relevant for your system
-	    // default is Argus VI c. 2010
-		List<string> parameters = new List<string>(new string[]{
-												"Deflection H2 Set",
-												"Deflection H1 Set",
-												"Deflection AX Set",
-												"Deflection L1 Set",
-												"Deflection L2 Set",
-												"Deflection CDD Set",
-												"CDD Supply Set",
-													});
+		// deflection of each detector of the selected instrument, then the ion counter supply
+		List<string> parameters = new List<string>();
+		foreach (string detname in DETECTOR_NAMES)
+		{
+			parameters.Add(String.Format("Deflection {0} Set", detname.Split(',')[1]));
+		}
+		parameters.Add("CDD Supply Set");
+
 		double value=0.0;
 		List<string> data = new List<string>();
 		foreach (var item in parameters)
 		{
 			if(Instrument.GetParameter(item, out value))
 			{
-				data.Add(String.Format("{0},{1}", item, value));
+				data.Add(String.Format("{0},{1}", item, Fmt(value)));
 			}
 		}
 		return String.Join(";", data.ToArray());

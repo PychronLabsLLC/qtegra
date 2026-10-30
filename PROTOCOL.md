@@ -182,7 +182,7 @@ hardware database, e.g. `Field Set`, `Y-Symmetry Set`, `CDD Supply Set`, `Deflec
 
 | Command | Arguments | Reply | Description |
 |---|---|---|---|
-| `ProtectDetector` | `<detector>,On\|Off` | `ok` | On saves the deflection and sets it to 2000, Off restores it. |
+| `ProtectDetector` | `<detector>,On\|Off` | `ok` | On saves the deflection and sets it to 2000, Off restores it. A repeated On keeps the saved deflection; Off without On does nothing. |
 | `GetDeflection` | `<detector>` | `number` | Deflection &lt;detector&gt; Set. |
 | `SetDeflection` | `<detector>,<value>` | `ok` |  |
 | `GetDeflections` | `<detector>[,<detector>...]` | `list:number` | 0 for a deflection that cannot be read. |

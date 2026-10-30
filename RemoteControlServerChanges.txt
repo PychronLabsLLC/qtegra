@@ -63,6 +63,8 @@ protocol
     added Describe and Describe commands (JSON), a protocol version, and a
     generated protocol.json; command arguments and replies are typed
     KeepAlive connections accept CR, LF or CRLF after each command
+    ProtectDetector On is safe to repeat: a second On no longer saves 2000 as
+    the deflection to restore. it also reports failures instead of always OK
     commands are registered in a table (RegisterCommands) instead of a switch
     GetSubCupParameters follows the selected instrument's detectors
 

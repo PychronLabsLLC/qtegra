@@ -39,7 +39,7 @@
 {"name":"GetHV","section":"Source","args":[],"reply":{"type":"number","unit":"kV"},"hardware":true,"description":"Acceleration Reference Set in kV. Note: SetHV takes V."},
 {"name":"SetHV","section":"Source","args":[{"name":"volts","type":"number","optional":false,"repeated":false,"separator":" "}],"reply":{"type":"ok"},"hardware":true,"description":"Same as SetHighVoltage. Note: takes V although GetHV returns kV."},
 {"name":"ProtectDetector","section":"Detectors","args":[{"name":"detector","type":"word","optional":false,"repeated":false,"separator":" "},
-{"name":"state","type":"enum","values":["On","Off"],"optional":false,"repeated":false,"separator":","}],"reply":{"type":"ok"},"hardware":true,"description":"On saves the deflection and sets it to 2000, Off restores it."},
+{"name":"state","type":"enum","values":["On","Off"],"optional":false,"repeated":false,"separator":","}],"reply":{"type":"ok"},"hardware":true,"description":"On saves the deflection and sets it to 2000, Off restores it. A repeated On keeps the saved deflection; Off without On does nothing."},
 {"name":"GetDeflection","section":"Detectors","args":[{"name":"detector","type":"text","optional":false,"repeated":false,"separator":" "}],"reply":{"type":"number"},"hardware":true,"description":"Deflection <detector> Set."},
 {"name":"SetDeflection","section":"Detectors","args":[{"name":"detector","type":"text","optional":false,"repeated":false,"separator":" "},
 {"name":"value","type":"number","optional":false,"repeated":false,"separator":","}],"reply":{"type":"ok"},"hardware":true,"description":""},

@@ -77,7 +77,7 @@ static class DispatchTest
         Check("SetMagnetDAC abc", Run("SetMagnetDAC abc"), r => r == "Error: invalid number in SetMagnetDAC abc");
         Check("SetMagnetDAC  0.1", Run("SetMagnetDAC  0.1"), r => r == "OK");
         Check("GetMagnetMoving", Run("GetMagnetMoving"), r => r == "False");
-        Check("GetParameter Field Set", Run("GetParameter Field Set"), r => r == "0");
+        Check("GetParameter Field Set", Run("GetParameter Field Set"), r => r == "0.1");
         Check("SetParameter Field Set,1.5", Run("SetParameter Field Set,1.5"), r => r == "OK");
         Check("GetSubCupParameters", Run("GetSubCupParameters"),
               r => r == "Deflection H1 Set,0;Deflection AX Set,0;Deflection CDD Set,0;CDD Supply Set,0");
@@ -88,6 +88,21 @@ static class DispatchTest
         Check("BlankBeam true", Run("BlankBeam true"), r => r == "OK");
         Check("BlankBeam false", Run("BlankBeam false"), r => r == "OK");
         Check("GetDeflections H1,AX", Run("GetDeflections H1,AX"), r => r == "0,0");
+        Check("SetDeflection L1,150", Run("SetDeflection L1,150"), r => r == "OK");
+        Check("ProtectDetector Off without On", Run("ProtectDetector L1,Off"), r => r == "OK");
+        Check("  ...leaves the deflection", Run("GetDeflection L1"), r => r == "150");
+        Check("ProtectDetector On", Run("ProtectDetector L1,On"), r => r == "OK");
+        Check("  ...deflects", Run("GetDeflection L1"), r => r == "2000");
+        Check("ProtectDetector On again", Run("ProtectDetector L1,On"), r => r == "OK");
+        Check("ProtectDetector Off", Run("ProtectDetector L1,Off"), r => r == "OK");
+        Check("  ...restores the original", Run("GetDeflection L1"), r => r == "150");
+        Check("ProtectDetector Off again", Run("ProtectDetector L1,Off"), r => r == "OK");
+        Check("  ...still the original", Run("GetDeflection L1"), r => r == "150");
+        Check("ProtectDetector On after Off", Run("ProtectDetector L1,On"), r => r == "OK");
+        Check("SetDeflection L1,175 while protected", Run("SetDeflection L1,175"), r => r == "OK");
+        Check("ProtectDetector Off", Run("ProtectDetector L1,Off"), r => r == "OK");
+        Check("  ...restores the saved value", Run("GetDeflection L1"), r => r == "150");
+        Check("ProtectDetector On, unreadable deflection", Run("ProtectDetector Nope,On"), r => r == "Error: could not read Deflection Nope Set");
         Check("Subscribe over dispatcher", Run("Subscribe"), r => r == "Error: Subscribe needs a TCP connection");
 
         Section("scan data");

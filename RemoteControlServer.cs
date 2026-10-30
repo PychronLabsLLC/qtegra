@@ -540,12 +540,11 @@ class RemoteControl
 			(a, rest) => SetParameter("Acceleration Reference Set", ToDouble(a[1])/1000.0));
 
 		Section("Detectors");
-		Register("ProtectDetector", "<detector:word>,<state:enum(On|Off)>", "ok", "On saves the deflection and sets it to 2000, Off restores it.",
+		Register("ProtectDetector", "<detector:word>,<state:enum(On|Off)>", "ok", "On saves the deflection and sets it to 2000, Off restores it. A repeated On keeps the saved deflection; Off without On does nothing.",
 			(a, rest) =>
 			{
 				string[] p = a[1].Split(',');
-				ProtectDetector(p[0], p[1]);
-				return "OK";
+				return ProtectDetector(p[0], p[1]);
 			});
 		Register("GetDeflection", "<detector:text>", "number", "Deflection <detector> Set.",
 			(a, rest) => ReadParameter(String.Format("Deflection {0} Set", rest), 1));
@@ -821,25 +820,36 @@ class RemoteControl
         }
 
     }
-    public static void ProtectDetector(string detname, string state)
+    // m_defl holds the deflection of each protected detector, so On is safe to repeat:
+    // a second On must not save the protecting 2000 as the value to restore
+    public static string ProtectDetector(string detname, string state)
     {
         string param=String.Format("Deflection {0} Set",detname);
         if (state.ToLower()=="on")
         {
-            double v;
-            Instrument.GetParameter(param, out v);
-            m_defl[detname]=v;
-            SetParameter(param, 2000);
-        }
-        else
-        {
-            if (m_defl.ContainsKey(detname))
+            if (!m_defl.ContainsKey(detname))
             {
-                SetParameter(param, m_defl[detname]);
+                double v;
+                if (!Instrument.GetParameter(param, out v))
+                {
+                    return String.Format("Error: could not read {0}", param);
+                }
+                m_defl[detname]=v;
             }
+            return SetParameter(param, 2000);
+        }
 
-	    }
-	}
+        if (!m_defl.ContainsKey(detname))
+        {
+            return "OK";
+        }
+        string result=SetParameter(param, m_defl[detname]);
+        if (result=="OK")
+        {
+            m_defl.Remove(detname);
+        }
+        return result;
+    }
 	public static String SetIonCounterState(String name, bool state)
 	{
 		Logger.Log (LogLevel.UserInfo, String.Format("Setting IonCounterState {0} {1}", name, state));

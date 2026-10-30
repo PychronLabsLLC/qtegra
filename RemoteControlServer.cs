@@ -75,6 +75,11 @@ static class Config
     public static double magnet_move_threshold=0.25;// threshold to trigger stepped magnet move in DAC units
     public static int magnet_steps=20; // number of steps to divide the total magnet displacement
     public static int magnet_step_time=100; //ms to delay between magnet steps
+    public static bool probe_scan_data=true; // log the structure of the first scan received. also see ProbeScanData command
+    public static bool debug=false; // also log the polled commands (GetData, GetDataN, GetNextData, Ping)
+    public static int tcp_read_timeout=5000; // ms a TCP client has to send its command before the connection is closed
+    public static int tcp_idle_timeout=60000; // ms a KeepAlive connection may sit idle before it is closed
+    public static int request_id_window=10000; // ms during which a repeated "#id command" gets the cached reply instead of running again
 
 }
 
@@ -85,10 +90,13 @@ class RemoteControl
     private static Socket UDP_SOCK;
     private static Thread SERVER_THREAD;
     private static TcpListener TCPLISTENER;
+    private static volatile bool RUNNING=true;
 
     private static double LAST_Y_SYMMETRY=0;
     private static bool IsBLANKED=false;
     private static Dictionary<string, double> m_defl = new Dictionary<string, double>();
+
+    private const string VERSION = "20.2"; // keep in sync with __version__ in the header
 
     private const int OPEN = 1;
     private const int CLOSE = 0;
@@ -97,28 +105,32 @@ class RemoteControl
     public static IRMSBaseMeasurementInfo m_restoreMeasurementInfo;
 
     private static string SCAN_DATA;
+    private static long SCAN_COUNT=0; // number of scans received. guarded by m_lock, which is pulsed on every scan
     private static object m_lock=new object();
+
+    // hardware commands run one at a time, whichever client or thread they come from
+    private static object m_command_lock=new object();
+    private static List<TcpClient> TCP_CLIENTS=new List<TcpClient>();
 
 
 	private static List<string> DETECTOR_NAMES;
 
-    private static bool MAGNET_MOVING=false;
+    private static volatile bool MAGNET_MOVING=false;
+    private static object m_magnet_lock=new object();
     private static bool CDDS_ARE_ON = false; // keeps track of CDD state as long as this is done through "ActivateAllCDDs" and "DeactivateAllCDDs"
+    private static volatile bool PROBE_PENDING = Config.probe_scan_data;
 
     public static void Main ()
     {
 
-        // Configure the proper instrument
+        // Select the instrument: leave exactly ONE line uncommented
         // ================================================================================
-        //Instrument= ArgusMC;
-        //DETECTOR_NAMES = Config.ARGUS_DETECTOR_NAMES
-
-        //Instrument= HelixMC;
-        //DETECTOR_NAMES = Config.HELIX_MC_DETECTOR_NAMES
+        //Instrument = ArgusMC;    DETECTOR_NAMES = Config.ARGUS_DETECTOR_NAMES;
+        //Instrument = HelixMC;    DETECTOR_NAMES = Config.HELIX_MC_DETECTOR_NAMES;
+        Instrument = HelixSFT;     DETECTOR_NAMES = Config.HELIX_SFT_DETECTOR_NAMES;
         // ================================================================================
 
-        Instrument= HelixSFT;
-        DETECTOR_NAMES = Config.HELIX_SFT_DETECTOR_NAMES;
+        RegisterCommands();
 
         //init parameters
         Instrument.GetParameter("Y-Symmetry Set", out LAST_Y_SYMMETRY);
@@ -151,20 +163,28 @@ class RemoteControl
     //  do not include the "<" or ">" in the commands.
     //  e.g SetTrapVoltage 120 not SetTrapVoltage <120>
     //  Commands:
+    //      GetVersion #version of this script
+    //      Help #comma separated list of all commands
+    //      Ping #returns OK
+    //      GetDataN #<scan count>|<data>
+    //      GetNextData [timeout s] [scan count] #waits for a newer scan, returns <scan count>|<data> or Error: timeout
+    //      Subscribe #TCP only: the server writes <scan count>|<data> + newline for every scan until the client disconnects
+    //      KeepAlive #TCP only, first command: keep the connection open, newline terminated commands and replies
+    //      #<id> <command> #any command with an id: reply is #<id> <reply>
     //      GetTuningSettingsList #return a comma separated string
-    //      SetTuningSettings
+    //      SetTuningSettings <name>
     //      GetData returns tagged data e.g. H2,aaa,L1,bbb,CDD,ccc
+    //      ProbeScanData #log the structure of the next scan to the Qtegra log (diagnostic)
     //      SetIntegrationTime <seconds>
     //      GetIntegrationTime <seconds>
     //      BlankBeam <true or false> if true set y-symmetry to -50 else return to previous value
 
     //===========Cup/SubCup Configurations==============================
     //      GetCupConfigurationList
-    //      GetSubCupConfigurationList
+    //      GetSubCupConfigurationList <cup name>
     //      GetActiveCupConfiguration
     //      GetActiveSubCupConfiguration
     //      GetSubCupParameters returns list of Deflection voltages and the Ion Counter supply voltage
-    //      SetSubCupConfiguration <sub cup name>
     //      ActivateCupConfiguration <cup name> <sub cup name>
 
     //===========Ion Counter============================================
@@ -172,15 +192,21 @@ class RemoteControl
     //      DeactivateIonCounter <detname>
 
     //===========Ion Pump Valve=========================================
-    //      Open  #open the Ion pump to the mass spec
-    //      Close #closes the Ion pump to the mass spec
-    //      GetValveState #returns True for open false for close
+    //      Open <name>  #open the Ion pump to the mass spec
+    //      Close <name> #closes the Ion pump to the mass spec
+    //      GetValveState <name> #returns True for open false for close
 
     //===========Magnet=================================================
     //      GetMagnetDAC
     //      SetMagnetDAC <value> #0-10V
     //      GetMagnetMoving
     //      @SetMass <value>,<string cupName> #deactivates the CDDs if they are active
+
+    //===========Source=================================================
+    //      GetHighVoltage #V
+    //      SetHighVoltage <V>
+    //      GetHV #kV
+    //      SetHV <V>  NOTE: GetHV returns kV but SetHV takes V
 
     //==========Detectors===============================================
     //      @ActivateAllCDDs #activates and unprotects all CDDs with a mass in the CupConfiguration
@@ -191,12 +217,15 @@ class RemoteControl
 	//      GetIonCounterVoltage
 	//      SetIonCounterVoltage <value>
 	//      GetGain <name>
+	//      SetGain <name>,<value>
 	//      GetDeflections <name>[,<name>,...]
 
 	//==================================================================
 	//		Error Responses:
 	//			Error: Invalid Command   - the command is poorly formated or does not exist.
 	//			Error: could not set <hardware> to <value>
+	//			Error: could not read <hardware>
+	//			Error: missing argument for <cmd> / Error: invalid number in <cmd>
 
      //==========Generic Device===============================================
 	//      GetParameter <name> -  name is any valid device currently listed in the hardware database
@@ -206,262 +235,301 @@ class RemoteControl
 
 	private static string ParseAndExecuteCommand (string cmd)
 	{
-
-		string result = "Error: Invalid Command";
-		Logger.Log(LogLevel.UserInfo, String.Format("Executing {0}", cmd));
-
-		string[] args = cmd.Trim().Split (' ');
-		string[] pargs;
-		string jargs;
-
-        double r;
-        switch (args[0]) {
-
-        case "GetDeflections":
-            result = GetDeflections(args);
-            break;
-        case "GetParameters":
-            result = GetParameters(args);
-            break;
-
-		case "GetTuningSettingsList":
-			result = GetTuningSettings();
-			break;
-
-		case "SetTuningSettings":
-			if(SetTuningSettings(args[1]))
-			{
-				result="OK";
-			}
-			else
-			{
-				result=String.Format("Error: could not set tuning settings {0}",args[1]);
-			}
-			break;
-
-		case "GetData":
-			result=SCAN_DATA;
-			break;
-
-		case "SetIntegrationTime":
-			result=SetIntegrationTime(Convert.ToDouble(args[1]));
-			break;
-		case "GetIntegrationTime":
-			result=GetIntegrationTime();
-			break;
-
-		case "BlankBeam":
-
-			if (!Config.use_beam_blank)
-			{
-				result="OK";
-				break;
-			}
-
-			double yval=LAST_Y_SYMMETRY;
-			bool blankbeam=false;
-			if (args[1].ToLower()=="true")
-			{
-				if(!IsBLANKED)
-				{
-					//remember the non blanking Y-Symmetry value
-					Instrument.GetParameter("Y-Symmetry Set", out LAST_Y_SYMMETRY);
-					yval=-50;
-					IsBLANKED=true;
-					blankbeam=true;
-				}
-			}
-			else
-			{
-				if(IsBLANKED)
-				{
-					IsBLANKED=false;
-					blankbeam=true;
-					result=SetParameter("Y-Symmetry Set",yval);
-				}
-			}
-
-			result="OK";
-			if(blankbeam)
-			{
-				result=SetParameter("Y-Symmetry Set",yval);
-			}
-
-			break;
-
-//============================================================================================
-//   Cup / SubCup Configurations
-//============================================================================================
-        case "GetCupConfigurationList":
-            List<string> cup_names = GetCupConfigurations ();
-            result = string.Join ("\r", cup_names.ToArray ());
-            break;
-
-        case "GetSubCupConfigurationList":
-            string config_name = args[1];
-            List<string> sub_names = GetSubCupConfigurations (config_name);
-            result = string.Join ("\r", sub_names.ToArray ());
-            break;
-
-        case "GetActiveCupConfiguration":
-            result=Instrument.CupConfigurationDataList.GetActiveCupConfiguration().Name;
-            break;
-
-        case "GetActiveSubCupConfiguration":
-            result=Instrument.CupConfigurationDataList.GetActiveSubCupConfiguration().Name;
-            break;
-
-        case "GetSubCupParameters":
-            result=GetSubCupParameters();
-            break;
-
-        case "ActivateCupConfiguration":
-            result = mActivateCup(args[1], args[2]);
-            break;
-//============================================================================================
-//   Ion Counter
-//============================================================================================
-		case "ActivateIonCounter":
-			result = SetIonCounterState(args[1], true);
-			break;
-		case "DeactivateIonCounter":
-			result = SetIonCounterState(args[1], false);
-			break;
-
-//============================================================================================
-//   Ion Pump Valve
-//============================================================================================
-        case "Open":
-        	Logger.Log(LogLevel.Debug, String.Format("Executing {0}", cmd));
-			jargs=String.Join(" ", Slice(args,1,0));
-			result=SetParameter(jargs,OPEN);
-			break;
-
-		case "Close":
-			jargs=String.Join(" ", Slice(args,1,0));
+		string result;
+		string name = cmd.Trim().Split(' ')[0];
+		bool quiet = !Config.debug && QUIET_COMMANDS.Contains(name);
+		if (!quiet)
+		{
 			Logger.Log(LogLevel.Debug, String.Format("Executing {0}", cmd));
-			result=SetParameter(jargs,CLOSE);
-			break;
-
-		case "GetValveState":
-			Logger.Log(LogLevel.Debug, String.Format("Executing {0}", cmd));
-
-			jargs=String.Join(" ", Slice(args,1,0));
-			result=GetValveState(jargs);
-			Logger.Log(LogLevel.Debug, String.Format("Valve state {0}", result));
-			break;
-
-//============================================================================================
-//   Magnet
-//============================================================================================
-        case "GetMagnetDAC":
-            if (Instrument.GetParameter("Field Set", out r))
-            {result=r.ToString();}
-            break;
-
-        case "SetMagnetDAC":
-            result=SetMagnetDAC(Convert.ToDouble(args[1]));
-            break;
-        case "GetMagnetMoving":
-            result=GetMagnetMoving();
-            break;
-        case "SetMass":
-            //Adapted from CSIRORemoteControlServer.cs
-			jargs=String.Join(" ", Slice(args,1,0));
-            pargs=jargs.Split(',');
-		   result = SetMass(Convert.ToDouble(pargs[0]),(pargs.Length>1) ? pargs[1] : null);
-            break;
-//============================================================================================
-//    Source Parameters
-//============================================================================================
-		case "GetHighVoltage":
-			if(Instrument.GetParameter("Acceleration Reference Set",out r))
-			{
-				result=(r*1000).ToString();
-			}
-			break;
-
-		case "SetHighVoltage":
-			result=SetParameter("Acceleration Reference Set", Convert.ToDouble(args[1])/1000.0);
-			break;
-		case "GetHV":
-			if(Instrument.GetParameter("Acceleration Reference Set",out r))
-			{
-				result=(r).ToString();
-			}
-			break;
-
-		case "SetHV":
-			result=SetParameter("Acceleration Reference Set", Convert.ToDouble(args[1])/1000.0);
-			break;
-//============================================================================================
-//    Detectors
-//============================================================================================
-        case "ProtectDetector":
-            pargs=args[1].Split(',');
-            ProtectDetector(pargs[0], pargs[1]);
-            result="OK";
-            break;
-
-        case "GetDeflection":
-            jargs=String.Join(" ", Slice(args,1,0));
-            if(Instrument.GetParameter(String.Format("Deflection {0} Set",jargs), out r))
-            {result=r.ToString();}
-            break;
-
-        case "SetDeflection":
-            jargs=String.Join(" ", Slice(args,1,0));
-            pargs=jargs.Split(',');
-            result=SetParameter(String.Format("Deflection {0} Set",pargs[0]),Convert.ToDouble(pargs[1]));
-            break;
-
-        case "GetIonCounterVoltage":
-            if(Instrument.GetParameter("CDD Supply Set",out r))
-            {result=r.ToString();}
-            break;
-
-        case "SetIonCounterVoltage":
-            result=SetParameter("CDD Supply Set", Convert.ToDouble(args[1]));
-            break;
-
-        case "GetGain":
-            jargs=String.Join(" ", Slice(args,1,0));
-            result=GetGain(jargs);
-            break;
-
-        case "SetGain":
-            jargs=String.Join(" ", Slice(args,1,0));
-            pargs=jargs.Split(',');
-            result="OK";
-            SetGain(pargs[0], Convert.ToDouble(pargs[1]));
-            break;
-
-        case "ActivateAllCDDs":
-		    result = ActivateAllCDDs();
-			break;
-
-		case "DeactivateAllCDDs":
-		    result = DeactivateAllCDDs();
-			break;
-//============================================================================================
-//    Generic
-//============================================================================================
-		case "GetParameter":
-		    jargs=String.Join(" ", Slice(args,1,0));
-			if(Instrument.GetParameter(jargs, out r))
-			{
-				result=r.ToString();
-			}
-			break;
-
-		case "SetParameter":
-		    jargs=String.Join(" ", Slice(args,1,0));
-            pargs=jargs.Split(',');
-		  result=SetParameter(pargs[0], Convert.ToDouble(pargs[1]));
-		  break;
 		}
-		log(String.Format("{0} => {1}", cmd, result));
+		try
+		{
+			result = ExecuteCommand(cmd);
+		}
+		catch (IndexOutOfRangeException)
+		{
+			result = String.Format("Error: missing argument for {0}", cmd);
+		}
+		catch (FormatException)
+		{
+			result = String.Format("Error: invalid number in {0}", cmd);
+		}
+		catch (Exception e)
+		{
+			Logger.Log(LogLevel.UserError, String.Format("{0} failed. {1}", cmd, e));
+			result = String.Format("Error: {0}", e.Message);
+		}
+
+		if (result == null)
+		{
+			result = "Error: no result";
+		}
+		if (!quiet)
+		{
+			log(String.Format("{0} => {1}", cmd, result));
+		}
 		return result;
+	}
+
+	// A request may carry an id: "#<id> <command>" is answered "#<id> <reply>", so a client can match
+	// replies to requests. A repeat of the same id and command from the same client within
+	// Config.request_id_window ms (a UDP retry) gets the cached reply instead of running the command again.
+	private class CachedReply
+	{
+		public string Command;
+		public string Reply;
+		public DateTime Time;
+	}
+	private static Dictionary<string, CachedReply> m_replies=new Dictionary<string, CachedReply>();
+	private static Queue<string> m_reply_keys=new Queue<string>();
+
+	private static string HandleRequest(string raw, string client)
+	{
+		string msg = raw.Trim();
+		if (!msg.StartsWith("#"))
+		{
+			return ParseAndExecuteCommand(msg);
+		}
+
+		int sp = msg.IndexOf(' ');
+		if (sp < 0)
+		{
+			return String.Format("{0} Error: Invalid Command", msg);
+		}
+		string id = msg.Substring(0, sp);
+		string cmd = msg.Substring(sp+1).Trim();
+		string key = client + " " + id;
+
+		CachedReply cached;
+		lock(m_replies)
+		{
+			if (m_replies.TryGetValue(key, out cached) && cached.Command == cmd &&
+				(DateTime.UtcNow - cached.Time).TotalMilliseconds < Config.request_id_window)
+			{
+				Logger.Log(LogLevel.Debug, String.Format("Repeated request {0} {1}, sending cached reply", id, cmd));
+				return id + " " + cached.Reply;
+			}
+		}
+
+		string reply = ParseAndExecuteCommand(cmd);
+
+		lock(m_replies)
+		{
+			if (!m_replies.ContainsKey(key))
+			{
+				m_reply_keys.Enqueue(key);
+				if (m_reply_keys.Count > 256)
+				{
+					m_replies.Remove(m_reply_keys.Dequeue());
+				}
+			}
+			cached = new CachedReply();
+			cached.Command = cmd;
+			cached.Reply = reply;
+			cached.Time = DateTime.UtcNow;
+			m_replies[key] = cached;
+		}
+		return id + " " + reply;
+	}
+
+	// args: the command split on spaces, args[0] is the command name
+	// rest: everything after the command name, rejoined with single spaces
+	private delegate string CommandHandler(string[] args, string rest);
+
+	private static Dictionary<string, CommandHandler> COMMANDS = new Dictionary<string, CommandHandler>();
+	private static List<string> COMMAND_NAMES = new List<string>();
+	// commands that do not touch the hardware, so they skip m_command_lock and answer straight away
+	private static List<string> QUICK_COMMANDS = new List<string>();
+	// polled commands, only logged when Config.debug is true
+	private static List<string> QUIET_COMMANDS = new List<string>(new string[]{"GetData", "GetDataN", "GetNextData", "Ping"});
+
+	private static void Register(string name, CommandHandler handler)
+	{
+		COMMANDS[name] = handler;
+		COMMAND_NAMES.Add(name);
+	}
+
+	private static void RegisterQuick(string name, CommandHandler handler)
+	{
+		Register(name, handler);
+		QUICK_COMMANDS.Add(name);
+	}
+
+	private static void RegisterCommands()
+	{
+		RegisterQuick("GetVersion", (a, rest) => VERSION);
+		RegisterQuick("Help", (a, rest) => String.Join(",", COMMAND_NAMES.ToArray()));
+		RegisterQuick("Ping", (a, rest) => "OK");
+
+		Register("GetTuningSettingsList", (a, rest) => GetTuningSettings());
+		Register("SetTuningSettings", (a, rest) => SetTuningSettings(a[1]) ? "OK" : String.Format("Error: could not set tuning settings {0}", a[1]));
+		RegisterQuick("GetData", (a, rest) => SCAN_DATA ?? "Error: no data");
+		RegisterQuick("GetDataN", (a, rest) => GetDataN());
+		RegisterQuick("GetNextData", (a, rest) => GetNextData(a));
+		RegisterQuick("Subscribe", (a, rest) => "Error: Subscribe needs a TCP connection");
+		RegisterQuick("ProbeScanData", (a, rest) => { PROBE_PENDING=true; return "OK"; });
+		Register("SetIntegrationTime", (a, rest) => SetIntegrationTime(ToDouble(a[1])));
+		Register("GetIntegrationTime", (a, rest) => GetIntegrationTime());
+		Register("BlankBeam", (a, rest) => BlankBeam(a[1]));
+
+		// Cup / SubCup Configurations
+		Register("GetCupConfigurationList", (a, rest) => string.Join("\r", GetCupConfigurations().ToArray()));
+		Register("GetSubCupConfigurationList", (a, rest) => GetSubCupConfigurationList(a[1]));
+		Register("GetActiveCupConfiguration", (a, rest) => Instrument.CupConfigurationDataList.GetActiveCupConfiguration().Name);
+		Register("GetActiveSubCupConfiguration", (a, rest) => Instrument.CupConfigurationDataList.GetActiveSubCupConfiguration().Name);
+		Register("GetSubCupParameters", (a, rest) => GetSubCupParameters());
+		Register("ActivateCupConfiguration", (a, rest) => mActivateCup(a[1], a[2]));
+
+		// Ion Counter
+		Register("ActivateIonCounter", (a, rest) => SetIonCounterState(a[1], true));
+		Register("DeactivateIonCounter", (a, rest) => SetIonCounterState(a[1], false));
+
+		// Ion Pump Valve
+		Register("Open", (a, rest) => SetParameter(rest, OPEN));
+		Register("Close", (a, rest) => SetParameter(rest, CLOSE));
+		Register("GetValveState", (a, rest) => GetValveState(rest));
+
+		// Magnet
+		Register("GetMagnetDAC", (a, rest) => ReadParameter("Field Set", 1));
+		Register("SetMagnetDAC", (a, rest) => SetMagnetDAC(ToDouble(a[1])));
+		RegisterQuick("GetMagnetMoving", (a, rest) => GetMagnetMoving());
+		Register("SetMass", (a, rest) =>
+		{
+			//Adapted from CSIRORemoteControlServer.cs
+			string[] p = rest.Split(',');
+			return SetMass(ToDouble(p[0]), (p.Length>1) ? p[1] : null);
+		});
+
+		// Source Parameters
+		Register("GetHighVoltage", (a, rest) => ReadParameter("Acceleration Reference Set", 1000));
+		Register("SetHighVoltage", (a, rest) => SetParameter("Acceleration Reference Set", ToDouble(a[1])/1000.0));
+		Register("GetHV", (a, rest) => ReadParameter("Acceleration Reference Set", 1));
+		Register("SetHV", (a, rest) => SetParameter("Acceleration Reference Set", ToDouble(a[1])/1000.0));
+
+		// Detectors
+		Register("ProtectDetector", (a, rest) =>
+		{
+			string[] p = a[1].Split(',');
+			ProtectDetector(p[0], p[1]);
+			return "OK";
+		});
+		Register("GetDeflection", (a, rest) => ReadParameter(String.Format("Deflection {0} Set", rest), 1));
+		Register("SetDeflection", (a, rest) =>
+		{
+			string[] p = rest.Split(',');
+			return SetParameter(String.Format("Deflection {0} Set", p[0]), ToDouble(p[1]));
+		});
+		Register("GetDeflections", (a, rest) => GetDeflections(a));
+		Register("GetIonCounterVoltage", (a, rest) => ReadParameter("CDD Supply Set", 1));
+		Register("SetIonCounterVoltage", (a, rest) => SetParameter("CDD Supply Set", ToDouble(a[1])));
+		Register("GetGain", (a, rest) => GetGain(rest));
+		Register("SetGain", (a, rest) =>
+		{
+			string[] p = rest.Split(',');
+			return SetGain(p[0], ToDouble(p[1]));
+		});
+		Register("ActivateAllCDDs", (a, rest) => ActivateAllCDDs());
+		Register("DeactivateAllCDDs", (a, rest) => DeactivateAllCDDs());
+
+		// Generic
+		Register("GetParameter", (a, rest) => ReadParameter(rest, 1));
+		Register("SetParameter", (a, rest) =>
+		{
+			string[] p = rest.Split(',');
+			return SetParameter(p[0], ToDouble(p[1]));
+		});
+		Register("GetParameters", (a, rest) => GetParameters(a));
+	}
+
+	private static string ExecuteCommand (string cmd)
+	{
+		string[] args = cmd.Trim().Split (new char[]{' '}, StringSplitOptions.RemoveEmptyEntries);
+		CommandHandler handler;
+		if (args.Length == 0 || !COMMANDS.TryGetValue(args[0], out handler))
+		{
+			return "Error: Invalid Command";
+		}
+		string rest = String.Join(" ", Slice(args, 1, 0));
+		if (QUICK_COMMANDS.Contains(args[0]))
+		{
+			return handler(args, rest);
+		}
+		lock(m_command_lock)
+		{
+			return handler(args, rest);
+		}
+	}
+
+	// "<scan count>|<data>". the count goes up by one for every scan, so a client can tell new data from old
+	private static string GetDataN()
+	{
+		lock(m_lock)
+		{
+			if (SCAN_DATA == null)
+			{
+				return "Error: no data";
+			}
+			return String.Format("{0}|{1}", SCAN_COUNT, SCAN_DATA);
+		}
+	}
+
+	// GetNextData [timeout seconds, default 5] [scan count]
+	// waits for a scan newer than the given count (default: the latest scan now) and returns it like GetDataN
+	private static string GetNextData(string[] a)
+	{
+		double timeout = (a.Length > 1) ? ToDouble(a[1]) : 5;
+		lock(m_lock)
+		{
+			long after = (a.Length > 2) ? Int64.Parse(a[2], CultureInfo.InvariantCulture) : SCAN_COUNT;
+			DateTime end = DateTime.UtcNow.AddSeconds(timeout);
+			while (SCAN_COUNT <= after)
+			{
+				int left = (int)(end - DateTime.UtcNow).TotalMilliseconds;
+				if (left <= 0 || !RUNNING)
+				{
+					return "Error: timeout";
+				}
+				Monitor.Wait(m_lock, left);
+			}
+			return String.Format("{0}|{1}", SCAN_COUNT, SCAN_DATA);
+		}
+	}
+
+	private static string BlankBeam(string arg)
+	{
+		if (!Config.use_beam_blank)
+		{
+			return "OK";
+		}
+
+		if (arg.ToLower()=="true")
+		{
+			if (IsBLANKED)
+			{
+				return "OK";
+			}
+			//remember the non blanking Y-Symmetry value
+			Instrument.GetParameter("Y-Symmetry Set", out LAST_Y_SYMMETRY);
+			IsBLANKED=true;
+			return SetParameter("Y-Symmetry Set", -50.0);
+		}
+
+		if (!IsBLANKED)
+		{
+			return "OK";
+		}
+		IsBLANKED=false;
+		return SetParameter("Y-Symmetry Set", LAST_Y_SYMMETRY);
+	}
+
+	private static string GetSubCupConfigurationList(string config_name)
+	{
+		List<string> sub_names = GetSubCupConfigurations (config_name);
+		if (sub_names == null)
+		{
+			return String.Format("Error: could not find cup configuration {0}", config_name);
+		}
+		return string.Join ("\r", sub_names.ToArray ());
 	}
 //============================================================================================
 //    EOCommands
@@ -486,17 +554,40 @@ class RemoteControl
         // deattach the handler from the ScanDataAvailable Event
         Instrument.ScanDataAvailable-=ScanDataAvailable;
 
-        //shutdown the server
-        if (Config.use_udp)
-        {
-            UDP_SOCK.Close();
-        }
-        else
+        //shutdown the server. the UDP loop wakes every 500 ms to check RUNNING; stopping the TCP listener
+        //unblocks the accept loop
+        RUNNING=false;
+        if (TCPLISTENER != null)
         {
             TCPLISTENER.Stop();
         }
+        lock(TCP_CLIENTS)
+        {
+            foreach (TcpClient client in TCP_CLIENTS)
+            {
+                client.Close();
+            }
+        }
+        lock(m_lock)
+        {
+            Monitor.PulseAll(m_lock);
+        }
 
-        SERVER_THREAD.Abort();
+        if (SERVER_THREAD != null && !SERVER_THREAD.Join(2000))
+        {
+            try
+            {
+                SERVER_THREAD.Abort();
+            }
+            catch (Exception)
+            {
+            }
+        }
+        // closed after the loop has stopped: closing a socket that another thread is reading can block
+        if (UDP_SOCK != null)
+        {
+            UDP_SOCK.Close();
+        }
 
     }
 
@@ -516,7 +607,7 @@ class RemoteControl
             {
                 v = 0;
             }
-            data.Add(v.ToString());
+            data.Add(Fmt(v));
         }
 
         return string.Join(",",data.ToArray());
@@ -532,7 +623,7 @@ class RemoteControl
            {
                 v = 0;
            }
-           data.Add(v.ToString());
+           data.Add(Fmt(v));
         }
 
         return string.Join(",",data.ToArray());
@@ -584,28 +675,20 @@ class RemoteControl
 	}
 	public static String SetIonCounterState(String name, bool state)
 	{
-		/*if (state)
-		{
-			Logger.Log (LogLevel.UserInfo, "Setting IonCounterState True");
-		}
-		else
-		{
-			Logger.Log (LogLevel.UserInfo, "Setting IonCounterState False");
-		}
+		Logger.Log (LogLevel.UserInfo, String.Format("Setting IonCounterState {0} {1}", name, state));
 
         // Adapted from CSIRORemoteControlServer.cs
-        // activate the CDDs...
-		if (!ActivateCounterCup(true, name))
+		if (!ActivateCounterCup(state, name))
 		{
-		    return String.Format("Could not activate {0}.", name};
+		    return String.Format("Error: could not set {0} active={1}", name, state);
 		}
 		Thread.Sleep(1000); // Wait for a little time for the activation to take effect...
 
-		// Restart the monitor scan, to ensure data is reported for the CDD...
-		if (!RunMonitorScan(get_scan_mass()))
+		// Restart the monitor scan, so data is (or is no longer) reported for the CDD...
+		if (!RunMonitorScan(Instrument.MeasurementInfo.ActualScanMass))
 		{
-			return "Could not restart monitor scan.";
-		}*/
+			return "Error: could not restart monitor scan.";
+		}
 
 	   return "OK";
 	}
@@ -644,9 +727,31 @@ class RemoteControl
 
 		if (!Instrument.SetParameter(hwname, val))
 		{
-			result=String.Format("Error: could not set {0} to {1}", hwname, val);
+			result=String.Format("Error: could not set {0} to {1}", hwname, Fmt(val));
 		}
 		return result;
+	}
+
+	// read a hardware parameter, multiplied by scale, formatted for the client
+	public static string ReadParameter(string hwname, double scale)
+	{
+		double r;
+		if (!Instrument.GetParameter(hwname, out r))
+		{
+			return String.Format("Error: could not read {0}", hwname);
+		}
+		return Fmt(r*scale);
+	}
+
+	// numbers to and from clients always use "." as the decimal separator, whatever the Windows locale
+	private static double ToDouble(string s)
+	{
+		return Double.Parse(s.Trim(), NumberStyles.Float, CultureInfo.InvariantCulture);
+	}
+
+	private static string Fmt(double v)
+	{
+		return v.ToString(CultureInfo.InvariantCulture);
 	}
 
     private static string ActivateAllCDDs()
@@ -685,7 +790,116 @@ class RemoteControl
 		return "OK";
 	}
 
+	// Adapted from activate_ion_counter / SampleFunctionIncludeScript.cs
+	private static bool ActivateAllCounterCups(bool activate)
+	{
+		try
+		{
+			Instrument.SetCDDActivationMode(new CollectorActivationMode(activate ? DetectorActivateMode.Standby : DetectorActivateMode.Off));
+			IRMSBaseCupConfigurationData activeCupData = Instrument.CupConfigurationDataList.GetActiveCupConfiguration();
+			foreach(IRMSBaseCollectorItem col in activeCupData.CollectorItemList)
+			{
+				if ((col.CollectorType == IRMSBaseCollectorType.CounterCup) && col.Mass.HasValue)
+				{
+					col.Active = activate;
+				}
+			}
+			UpdateCounterCupProtection(activeCupData);
+		}
+		catch (Exception e)
+		{
+			Logger.Log(LogLevel.UserError, String.Format("Could not set counter cups active={0}. {1}", activate, e));
+			return false;
+		}
+		return true;
+	}
+
+	private static bool ActivateCounterCup(bool activate, string name)
+	{
+		try
+		{
+			string id = mGetDetectorIdentifier(name);
+			bool found = false;
+			IRMSBaseCupConfigurationData activeCupData = Instrument.CupConfigurationDataList.GetActiveCupConfiguration();
+			foreach(IRMSBaseCollectorItem col in activeCupData.CollectorItemList)
+			{
+				if ((col.CollectorType == IRMSBaseCollectorType.CounterCup) && col.Mass.HasValue &&
+					(col.Identifier == id || col.Appearance.Label == name))
+				{
+					col.Active = activate;
+					found = true;
+				}
+			}
+			if (!found)
+			{
+				Logger.Log(LogLevel.UserError, String.Format("Counter cup {0} not found in active cup configuration", name));
+				return false;
+			}
+			if (activate)
+			{
+				Instrument.SetCDDActivationMode(new CollectorActivationMode(DetectorActivateMode.Standby));
+			}
+			UpdateCounterCupProtection(activeCupData);
+		}
+		catch (Exception e)
+		{
+			Logger.Log(LogLevel.UserError, String.Format("Could not set {0} active={1}. {2}", name, activate, e));
+			return false;
+		}
+		return true;
+	}
+
+	// Protect all counter cups, then unprotect only the ones that are still active
+	private static void UpdateCounterCupProtection(IRMSBaseCupConfigurationData activeCupData)
+	{
+		List<string> activeCups = new List<string>();
+		foreach(IRMSBaseCollectorItem col in activeCupData.CollectorItemList)
+		{
+			if ((col.CollectorType == IRMSBaseCollectorType.CounterCup) && col.Active)
+			{
+				activeCups.Add(col.Appearance.Label);
+			}
+		}
+
+		Instrument.ProtectAllCounterCupsWithPostDelay(Instrument.BaseSettingsData.CounterProtectionPreDelay);
+		if (activeCups.Count > 0)
+		{
+			Instrument.UnprotectRequiredCounterCups(activeCups);
+		}
+	}
+
+	// Mass on a cup = GammaCorrection * axial mass (see GetActualMass in CSIRORemoteControlServer.cs)
+	private static double? ConvertMassToAxial(string name, double mass)
+	{
+		string id = mGetDetectorIdentifier(name);
+		IRMSBaseCupConfigurationData activeCupData = Instrument.CupConfigurationDataList.GetActiveCupConfiguration();
+		foreach(IRMSBaseCollectorItem col in activeCupData.CollectorItemList)
+		{
+			if ((col.Identifier == id || col.Appearance.Label == name) && col.GammaCorrection != 0)
+			{
+				return mass / col.GammaCorrection;
+			}
+		}
+		return null;
+	}
+
     private static string SetMass(double m, string cup)
+	{
+		if (!TryStartMagnetMove())
+		{
+			return "Error: magnet is moving";
+		}
+		try
+		{
+			return mSetMass(m, cup);
+		}
+		finally
+		{
+			MAGNET_MOVING=false;
+		}
+	}
+
+	private static string mSetMass(double m, string cup)
 	{
 		// First deactivate CDDs to protect them.
 		if (!(DeactivateAllCDDs()=="OK"))
@@ -695,10 +909,10 @@ class RemoteControl
 
 		// If mass is not for AX cup, convert the mass to a value for the AX cup
 		double AXMass = m;
-		log(AXMass.ToString());
-		if (cup!="AX")
+		log(Fmt(AXMass));
+		if (cup!=null && cup.Trim()!="AX")
 		{
-			double? tempMass = ConvertMassToAxial(cup,m);
+			double? tempMass = ConvertMassToAxial(cup.Trim(),m);
 			if (!tempMass.HasValue)
 			{
 				return "Error: Cup not recognized";
@@ -715,8 +929,8 @@ class RemoteControl
 		int count = 0;
 		while (currentMass != AXMass) //For large changes, do it stepwise to avoid ringing
 		{
-			if ((Math.Abs(currentMass-AXMass)/currentMass) < Config.magnet_move_threshold_rel_mass) //for smallk
-			changes
+			if (currentMass<=0 || count>=100 ||
+				(Math.Abs(currentMass-AXMass)/currentMass) < Config.magnet_move_threshold_rel_mass) //for small changes
 			{
 				currentMass = AXMass;
 			}
@@ -745,19 +959,31 @@ class RemoteControl
 		string result="OK";
 		double current_dac;
 
-		if (Instrument.GetParameter("Field Set", out current_dac))
+		if (!Instrument.GetParameter("Field Set", out current_dac))
 		{
-			double dev=Math.Abs(d-current_dac);
-			if (dev>Config.magnet_move_threshold)
-			{
-                Thread t= new Thread(delegate(){mSetMagnetDAC(d,dev,current_dac);});
-                t.Start();
+			return "Error: could not read Field Set";
+		}
+		if (!TryStartMagnetMove())
+		{
+			return "Error: magnet is moving";
+		}
 
-                result="OK";
-            }
-            else
+		double dev=Math.Abs(d-current_dac);
+		if (dev>Config.magnet_move_threshold)
+		{
+            // MAGNET_MOVING stays true until the stepping thread finishes
+            Thread t= new Thread(delegate(){mSetMagnetDAC(d,dev,current_dac);});
+            t.Start();
+        }
+        else
+        {
+            try
             {
                 result=SetParameter("Field Set", d);
+            }
+            finally
+            {
+                MAGNET_MOVING=false;
             }
         }
         return result;
@@ -766,30 +992,53 @@ class RemoteControl
 
     public static void mSetMagnetDAC(double d, double dev, double current_dac)
     {
-        MAGNET_MOVING=true;
-        //incrementally move the magnet to eliminate "ringing"
-        double step=dev/Config.magnet_steps;
-        int sign=1;
-
-        if (current_dac>d)
+        try
         {
-            sign=-1;
-        }
+            //incrementally move the magnet to eliminate "ringing"
+            double step=dev/Config.magnet_steps;
+            int sign=1;
 
-        for(int i=1; i<=Config.magnet_steps; i++)
-        {
-            SetParameter("Field Set", current_dac+sign*i*step);
-            if (Config.magnet_step_time>0)
+            if (current_dac>d)
             {
-                Thread.CurrentThread.Join(Config.magnet_step_time);
+                sign=-1;
+            }
+
+            for(int i=1; i<=Config.magnet_steps; i++)
+            {
+                SetParameter("Field Set", current_dac+sign*i*step);
+                if (Config.magnet_step_time>0)
+                {
+                    Thread.CurrentThread.Join(Config.magnet_step_time);
+                }
             }
         }
-        MAGNET_MOVING=false;
+        catch (Exception e)
+        {
+            Logger.Log(LogLevel.UserError, String.Format("Magnet move failed. {0}", e));
+        }
+        finally
+        {
+            MAGNET_MOVING=false;
+        }
+    }
+
+    // only one magnet move (SetMagnetDAC or SetMass) at a time
+    private static bool TryStartMagnetMove()
+    {
+        lock(m_magnet_lock)
+        {
+            if (MAGNET_MOVING)
+            {
+                return false;
+            }
+            MAGNET_MOVING=true;
+            return true;
+        }
     }
 
     public static string GetIntegrationTime()
     {
-        string result=String.Format("{0}", Instrument.MeasurementInfo.IntegrationTime*0.001);
+        string result=Fmt(Instrument.MeasurementInfo.IntegrationTime*0.001);
         return result;
     }
 
@@ -802,13 +1051,13 @@ class RemoteControl
         if (!Instrument.ScanTransitionController.StartMonitoring (nMI))
         {
             Logger.Log(LogLevel.UserError, "Could not start the modified monitor");
-            result=String.Format("Error: could not set integration time to {0}",t);
+            result=String.Format("Error: could not set integration time to {0}",Fmt(t));
         }
 
         return result;
     }
 
-    public static void SetGain(String name, double v)
+    public static string SetGain(String name, double v)
     {
         string id = mGetDetectorIdentifier(name);
         foreach (UFCCalibrationData item in Instrument.UFCCalibrationData)
@@ -816,26 +1065,23 @@ class RemoteControl
             if (item.Identifier==id)
             {
                 item.Gain=v;
-                break;
+                return "OK";
             }
         }
-
+        return String.Format("Error: unknown detector {0}", name);
     }
 
     public static string GetGain(String name)
     {
-        double gain=0;
         string id = mGetDetectorIdentifier(name);
         foreach (UFCCalibrationData item in Instrument.UFCCalibrationData)
         {
             if (item.Identifier==id)
             {
-                gain=Convert.ToDouble(item.Gain);
-                break;
+                return Fmt(Convert.ToDouble(item.Gain));
             }
         }
-
-	  return String.Format("{0}",gain);
+        return String.Format("Error: unknown detector {0}", name);
 	}
 
     private static string get_cup_name(IRMSBaseCollectorItem item)
@@ -860,6 +1106,12 @@ class RemoteControl
 			Spectrum spec = e.Value.Clone() as Spectrum;
 			IRMSBaseCupConfigurationData cupData = Instrument.CupConfigurationDataList.GetActiveCupConfiguration();
 
+			if (PROBE_PENDING)
+			{
+				PROBE_PENDING=false;
+				ProbeScanData(spec, cupData);
+			}
+
 			foreach (Series series in spec)
 			{
 				foreach (SpectrumData point in series)
@@ -871,7 +1123,7 @@ class RemoteControl
 						{	string cupName=get_cup_name(item);
 
 
-							data.Add(point.Analog.ToString());
+							data.Add(Fmt(point.Analog));
 							if (Config.tag_data)
 							{
 								data.Add(cupName);
@@ -885,6 +1137,80 @@ class RemoteControl
 			}
 			data.Reverse();
 			SCAN_DATA=string.Join(",",data.ToArray());
+			SCAN_COUNT++;
+			Monitor.PulseAll(m_lock); // wake GetNextData and Subscribe
+		}
+	}
+
+	// Diagnostic: log what a scan contains so we can tell whether a Series knows which
+	// detector it came from, and how far point masses drift from the cup configuration masses.
+	private static void ProbeScanData(Spectrum spec, IRMSBaseCupConfigurationData cupData)
+	{
+		try
+		{
+			log("==== ProbeScanData start ====");
+			log(String.Format("ActualScanMass={0}", Instrument.MeasurementInfo.ActualScanMass));
+			foreach (IRMSBaseCollectorItem item in cupData.CollectorItemList)
+			{
+				log(String.Format("Collector Identifier={0}, Label={1}, Type={2}, Active={3}, Mass={4}, GammaCorrection={5}",
+					item.Identifier, item.Appearance.Label, item.CollectorType, item.Active, item.Mass, item.GammaCorrection));
+			}
+
+			logproperties(spec, "Spectrum");
+			listattributes(spec.GetType(), "Spectrum");
+
+			int i=0;
+			foreach (Series series in spec)
+			{
+				logproperties(series, String.Format("Series[{0}]", i));
+				if (i==0)
+				{
+					listattributes(series.GetType(), "Series");
+				}
+
+				int j=0;
+				foreach (SpectrumData point in series)
+				{
+					if (j>=20)
+					{
+						log(String.Format("Series[{0}] has more points, not logged", i));
+						break;
+					}
+					logproperties(point, String.Format("Series[{0}].Point[{1}]", i, j));
+					if (i==0 && j==0)
+					{
+						listattributes(point.GetType(), "SpectrumData");
+					}
+					j++;
+				}
+				i++;
+			}
+			log("==== ProbeScanData end ====");
+		}
+		catch (Exception e)
+		{
+			Logger.Log(LogLevel.Warning, String.Format("ProbeScanData failed. {0}", e));
+		}
+	}
+
+	private static void logproperties(object obj, string identifier)
+	{
+		foreach (PropertyInfo pi in obj.GetType().GetProperties())
+		{
+			if (pi.GetIndexParameters().Length>0)
+			{
+				continue;
+			}
+			string value;
+			try
+			{
+				value=String.Format("{0}", pi.GetValue(obj, null));
+			}
+			catch (Exception e)
+			{
+				value=String.Format("<{0}>", e.GetType().Name);
+			}
+			log(String.Format("{0}.{1}={2}", identifier, pi.Name, value));
 		}
 	}
 
@@ -918,7 +1244,11 @@ class RemoteControl
 				cupData.CollectorItemList,
 				cupData.MassCalibration
 				);
-		Instrument.ScanTransitionController.StartMonitoring(newMeasurementInfo);
+		if (!Instrument.ScanTransitionController.StartMonitoring(newMeasurementInfo))
+		{
+			Logger.Log(LogLevel.UserError, "Could not start monitor scan");
+			return false;
+		}
 		return true;
 	}
 
@@ -961,24 +1291,21 @@ class RemoteControl
 
 	private static string GetSubCupParameters()
 	{
-	  // change parameters to values relevant for your system
-	    // default is Argus VI c. 2010
-		List<string> parameters = new List<string>(new string[]{
-												"Deflection H2 Set",
-												"Deflection H1 Set",
-												"Deflection AX Set",
-												"Deflection L1 Set",
-												"Deflection L2 Set",
-												"Deflection CDD Set",
-												"CDD Supply Set",
-													});
+		// deflection of each detector of the selected instrument, then the ion counter supply
+		List<string> parameters = new List<string>();
+		foreach (string detname in DETECTOR_NAMES)
+		{
+			parameters.Add(String.Format("Deflection {0} Set", detname.Split(',')[1]));
+		}
+		parameters.Add("CDD Supply Set");
+
 		double value=0.0;
 		List<string> data = new List<string>();
 		foreach (var item in parameters)
 		{
 			if(Instrument.GetParameter(item, out value))
 			{
-				data.Add(String.Format("{0},{1}", item, value));
+				data.Add(String.Format("{0},{1}", item, Fmt(value)));
 			}
 		}
 		return String.Join(";", data.ToArray());
@@ -1087,25 +1414,44 @@ class RemoteControl
 
         IPEndPoint ipep = new IPEndPoint(IPAddress.Any, Config.port);
         UDP_SOCK = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+        try
+        {
+            // Windows: stop a reply to a client that has gone away from making the next ReceiveFrom fail
+            const int SIO_UDP_CONNRESET = -1744830452;
+            UDP_SOCK.IOControl(SIO_UDP_CONNRESET, new byte[]{0, 0, 0, 0}, null);
+        }
+        catch (Exception)
+        {
+        }
         UDP_SOCK.Bind(ipep);
+        UDP_SOCK.ReceiveTimeout = 500; // wake up regularly to check RUNNING
 
         IPEndPoint sender = new IPEndPoint(IPAddress.Any, 0);
         EndPoint remote = (EndPoint)(sender);
 
-        while(true)
+        while(RUNNING)
         {
             try
             {
                 recv=UDP_SOCK.ReceiveFrom(data, ref remote);
                 string rdata = Encoding.ASCII.GetString(data,0, recv);
 
-                string result = ParseAndExecuteCommand(rdata.Trim());
+                string result = HandleRequest(rdata, remote.ToString());
 
                 //Logger.Log(LogLevel.Debug, String.Format("Sending back {0}", result));
                 UDP_SOCK.SendTo(Encoding.ASCII.GetBytes(result), remote);
             } catch (Exception e) {
-            string error = string.Format ("Could not read from UDP sock. {0}", e.ToString ());
-            Logger.Log(LogLevel.Warning, error);
+                SocketException se = e as SocketException;
+                if (se != null && se.SocketErrorCode == SocketError.TimedOut)
+                {
+                    continue; // nothing received in the last 500 ms
+                }
+                if (!RUNNING)
+                {
+                    break;
+                }
+                string error = string.Format ("Could not read from UDP sock. {0}", e.ToString ());
+                Logger.Log(LogLevel.Warning, error);
             }
 
         }
@@ -1115,27 +1461,129 @@ class RemoteControl
 
         Logger.Log (LogLevel.UserInfo, "TCP Listening");
 
-        while (true) {
-            TCPHandle(TCPLISTENER.AcceptTcpClient ());
-
-            //TcpClient client = TCPLISTENER.AcceptTcpClient ();
-            //Thread clientThread = new Thread (new ParameterizedThreadStart (TCPHandle));
-            //clientThread.Start (client);
+        while (RUNNING) {
+            try
+            {
+                // one thread per connection, so a slow or silent client does not block the others
+                TcpClient client = TCPLISTENER.AcceptTcpClient ();
+                Thread clientThread = new Thread (delegate() { TCPHandle(client); });
+                clientThread.IsBackground = true;
+                clientThread.Start ();
+            }
+            catch (Exception e)
+            {
+                if (!RUNNING)
+                {
+                    break;
+                }
+                Logger.Log(LogLevel.Warning, String.Format("TCP accept failed. {0}", e));
+            }
         }
     }
 
+    // A connection handles one command and is closed after the reply, as clients have always used it,
+    // unless the first command is
+    //    KeepAlive  - reply "OK\n", then handle newline terminated commands, each answered with reply + "\n",
+    //                 until the client disconnects or is idle for Config.tcp_idle_timeout ms
+    //    Subscribe  - write "<scan count>|<data>\n" for every scan until the client disconnects
     private static void TCPHandle (TcpClient tcpClient)
     {
-        //TcpClient tcpClient = (TcpClient)client;
+        lock(TCP_CLIENTS)
+        {
+            TCP_CLIENTS.Add(tcpClient);
+        }
+        try
+        {
+            tcpClient.ReceiveTimeout = Config.tcp_read_timeout;
+            tcpClient.SendTimeout = Config.tcp_read_timeout;
+            NetworkStream stream = tcpClient.GetStream ();
+            string client = tcpClient.Client.RemoteEndPoint.ToString();
 
-        NetworkStream _stream = tcpClient.GetStream ();
-        //string response = Read (_stream);
+            string first = TCPRead(stream);
+            if (first.Length == 0)
+            {
+                return;
+            }
 
-        string result = ParseAndExecuteCommand (TCPRead(_stream).Trim());
+            int nl = first.IndexOf('\n');
+            string firstcmd = ((nl < 0) ? first : first.Substring(0, nl)).Trim();
+            if (firstcmd == "KeepAlive")
+            {
+                TCPWrite(stream, "OK\n");
+                tcpClient.ReceiveTimeout = Config.tcp_idle_timeout;
+                TCPKeepAlive(stream, client, new StringBuilder((nl < 0) ? "" : first.Substring(nl + 1)));
+            }
+            else if (firstcmd == "Subscribe")
+            {
+                TCPSubscribe(stream);
+            }
+            else
+            {
+                TCPWrite(stream, HandleRequest(first, client));
+            }
+        }
+        catch (Exception e)
+        {
+            // timeouts and clients going away end up here
+            Logger.Log(LogLevel.Debug, String.Format("TCP connection closed. {0}", e.Message));
+        }
+        finally
+        {
+            lock(TCP_CLIENTS)
+            {
+                TCP_CLIENTS.Remove(tcpClient);
+            }
+            tcpClient.Close();
+        }
+    }
 
-        TCPWrite(_stream, result);
+    private static void TCPKeepAlive (NetworkStream stream, string client, StringBuilder buffer)
+    {
+        string line;
+        while (RUNNING && (line = TCPReadLine(stream, buffer)) != null)
+        {
+            line = line.Trim();
+            if (line.Length == 0)
+            {
+                continue;
+            }
+            if (line == "Subscribe")
+            {
+                TCPSubscribe(stream);
+                return;
+            }
+            TCPWrite(stream, HandleRequest(line, client) + "\n");
+        }
+    }
 
-        tcpClient.Close();
+    private static void TCPSubscribe (NetworkStream stream)
+    {
+        long last;
+        lock(m_lock)
+        {
+            last = SCAN_COUNT;
+        }
+        while (RUNNING)
+        {
+            string line = null;
+            lock(m_lock)
+            {
+                if (SCAN_COUNT <= last)
+                {
+                    Monitor.Wait(m_lock, 1000);
+                }
+                if (SCAN_COUNT > last)
+                {
+                    last = SCAN_COUNT;
+                    line = String.Format("{0}|{1}\n", SCAN_COUNT, SCAN_DATA);
+                }
+            }
+            if (line != null)
+            {
+                // throws once the client has gone away, which ends the subscription
+                TCPWrite(stream, line);
+            }
+        }
     }
     //====================================================================================================================================
     //Network Methods
@@ -1144,34 +1592,47 @@ class RemoteControl
     private static void TCPWrite (NetworkStream stream, string cmd)
     {
         if (stream.CanWrite) {
-            Byte[] sendBytes = Encoding.UTF8.GetBytes (cmd);
+            Byte[] sendBytes = Encoding.ASCII.GetBytes (cmd);
             stream.Write (sendBytes, 0, sendBytes.Length);
         }
     }
 
+    // read whatever the client has sent so far. "" if the client closed the connection
     private static string TCPRead (NetworkStream stream)
     {
-        int BufferSize = 1024;
-        byte[] data = new byte[BufferSize];
-        try {
-            StringBuilder myCompleteMessage = new StringBuilder ();
-            int numberOfBytesRead = 0;
+        byte[] data = new byte[1024];
+        StringBuilder myCompleteMessage = new StringBuilder ();
+        int numberOfBytesRead = 0;
 
-            // Incoming message may be larger than the buffer size.
-            do {
-                numberOfBytesRead = stream.Read (data, 0, data.Length);
+        // Incoming message may be larger than the buffer size.
+        do {
+            numberOfBytesRead = stream.Read (data, 0, data.Length);
+            myCompleteMessage.Append (Encoding.ASCII.GetString (data, 0, numberOfBytesRead));
+        } while (numberOfBytesRead > 0 && stream.DataAvailable);
 
-                myCompleteMessage.AppendFormat ("{0}", Encoding.ASCII.GetString (data, 0, numberOfBytesRead));
-            } while (stream.DataAvailable);
+        return myCompleteMessage.ToString ();
+    }
 
-            //string rd = string.Format ("Read Data: {0} the received text is '{1}'", numberOfBytesRead, myCompleteMessage);
-
-            return myCompleteMessage.ToString ();
-        } catch (Exception e) {
-            string error = string.Format ("Could not read from the NetworkStream. {0}", e.ToString ());
-            Logger.Log(LogLevel.Warning, error);
+    // next newline terminated line, using buffer for data already received. null if the client closed the connection
+    private static string TCPReadLine (NetworkStream stream, StringBuilder buffer)
+    {
+        byte[] data = new byte[1024];
+        while (true)
+        {
+            string pending = buffer.ToString();
+            int nl = pending.IndexOf('\n');
+            if (nl >= 0)
+            {
+                buffer.Remove(0, nl + 1);
+                return pending.Substring(0, nl);
+            }
+            int n = stream.Read(data, 0, data.Length);
+            if (n == 0)
+            {
+                return null;
+            }
+            buffer.Append(Encoding.ASCII.GetString(data, 0, n));
         }
-        return string.Empty;
     }
 
 

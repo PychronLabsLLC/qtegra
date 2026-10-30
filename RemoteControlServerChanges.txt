@@ -12,3 +12,53 @@ version 004
 
 added Get <name> to the protocol. 
 Allows querying of any valid device, ie devices listed in the hardware database. see Configurator
+
+Versions 005 - 19.10 (2012 - 2019)
+see git history
+
+
+2/18/2020
+version 20.2
+
+modifications by Axel Suckow, Alec Deslandes, Christoph Gerber (CSIRO)
+added ActivateAllCDDs and DeactivateAllCDDs
+SetMass uses Config.magnet_move_threshold_rel_mass
+HelixSFT selected as the instrument
+did not compile: see next entry
+
+
+10/29/2026
+unreleased (branch fix/phase0-compile, based on 20.2)
+
+compile fixes
+    restored missing CDD helpers (ActivateAllCounterCups, ActivateCounterCup,
+    ConvertMassToAxial) so the script compiles without an include script
+    ActivateIonCounter/DeactivateIonCounter work again and honour on/off
+    SetMass without a cup uses AX
+
+robustness
+    every command gets exactly one reply. errors reply "Error: ..." instead of
+    timing out (UDP) or killing the server thread (TCP)
+    numbers are parsed and formatted with "." whatever the Windows locale
+    read failures, unknown detectors and unknown cup configurations reply with
+    an error instead of 0, OK or nothing
+    only one magnet move (SetMagnetDAC/SetMass) at a time
+    clean shutdown of the listen loop
+
+protocol
+    added GetVersion, Help, Ping and ProbeScanData (diagnostic)
+    optional request ids: "#<id> <command>" -> "#<id> <reply>"; a retried id is
+    answered from cache instead of running again
+    GetDataN and GetNextData: scan data with a scan count, and waiting for the
+    next scan instead of polling
+    TCP: a thread per connection, read timeout, KeepAlive (persistent,
+    newline terminated) and Subscribe (server pushes every scan)
+    hardware commands run one at a time; state-only commands answer at once
+    Config.debug: polled commands are only logged when set
+    commands are registered in a table (RegisterCommands) instead of a switch
+    GetSubCupParameters follows the selected instrument's detectors
+
+known issues
+    GetData drops values after a magnet move (labels values by exact mass
+    match). use ProbeScanData to investigate
+    GetHV returns kV but SetHV takes V

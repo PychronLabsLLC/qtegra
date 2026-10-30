@@ -24,7 +24,6 @@ Files
     SampleFunctionScript.cs,
     SampleFunctionIncludeScript.cs,
     activate_ion_counter            Thermo sample code the server borrows from
-    protocol.txt                    Pychron system/laser protocol (not Qtegra)
     tools/offline_check/            compile, PROTOCOL.md and server checks without Qtegra
     tools/smoke_test.py             read-only test client for a running server
     tools/list_parameters.py        candidate parameter names from a .imhwd file

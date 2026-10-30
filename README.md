@@ -55,6 +55,12 @@ Everything else is in the Config class at the top of the script:
     magnet_steps, magnet_step_time  number of steps and ms between them
     magnet_move_threshold_rel_mass  relative mass change above which SetMass steps
     probe_scan_data                 log the structure of the first scan (diagnostic)
+    debug                           also log polled commands (GetData, GetDataN,
+                                    GetNextData, Ping). off by default
+    tcp_read_timeout                ms a TCP client has to send its command (5000)
+    tcp_idle_timeout                ms an idle KeepAlive connection stays open (60000)
+    request_id_window               ms a repeated "#id command" is answered from
+                                    cache instead of running again (10000)
 
 Protocol
 ========
@@ -66,11 +72,32 @@ Each command gets exactly one reply: a value, "OK", or a line starting with
 
     Help        lists every command
     GetVersion  returns the script version
+    Ping        returns OK
 
 See rcs_protocol.txt for the full command list.
 
-Over TCP the server handles one command per connection: connect, send the
-command, read the reply until the server closes the connection.
+Request ids: prefix any command with "#<id> " and the reply comes back as
+"#<id> <reply>", so a client can match replies to requests and drop late ones.
+If the same client repeats the same id and command within request_id_window
+ms (a UDP retry), it gets the cached reply and the command is not run again.
+
+Scan data: GetDataN returns "<scan count>|<data>"; the count goes up by one for
+every scan. GetNextData [timeout s] [scan count] waits for a newer scan instead
+of polling. Over UDP a waiting GetNextData holds up the other commands, so
+prefer TCP for it.
+
+TCP: each connection gets its own thread, and a client that sends nothing is
+dropped after tcp_read_timeout ms. By default a connection handles one
+command: connect, send it, read the reply until the server closes the
+connection. If the first command is
+    KeepAlive   the connection stays open: send newline terminated commands,
+                each reply ends with a newline
+    Subscribe   the server writes "<scan count>|<data>" + newline for every scan
+                until the client disconnects (also allowed after KeepAlive)
+
+Commands that only read the script's own state (GetData*, GetMagnetMoving,
+Ping, Help, GetVersion, ProbeScanData) answer straight away. Hardware commands
+run one at a time.
 
 Diagnostics
 ===========
@@ -86,10 +113,10 @@ Without Qtegra (needs the .NET SDK):
 
     tools/offline_check/run.sh
 
-This compiles RemoteControlServer.cs against stand-ins for the Thermo types and
-runs the command dispatcher with a fake instrument. The stand-ins are guessed
-from how the script uses the Thermo API, so passing here does not guarantee the
-script compiles in Qtegra.
+This compiles RemoteControlServer.cs as C# 4 against stand-ins for the Thermo
+types, then runs commands, request ids, scan data and the UDP and TCP servers
+with a fake instrument. The stand-ins are guessed from how the script uses the
+Thermo API, so passing here does not guarantee the script compiles in Qtegra.
 
 Against a running server (Python 3, read-only commands only):
 

@@ -46,7 +46,15 @@ robustness
     clean shutdown of the listen loop
 
 protocol
-    added GetVersion, Help and ProbeScanData (diagnostic)
+    added GetVersion, Help, Ping and ProbeScanData (diagnostic)
+    optional request ids: "#<id> <command>" -> "#<id> <reply>"; a retried id is
+    answered from cache instead of running again
+    GetDataN and GetNextData: scan data with a scan count, and waiting for the
+    next scan instead of polling
+    TCP: a thread per connection, read timeout, KeepAlive (persistent,
+    newline terminated) and Subscribe (server pushes every scan)
+    hardware commands run one at a time; state-only commands answer at once
+    Config.debug: polled commands are only logged when set
     commands are registered in a table (RegisterCommands) instead of a switch
     GetSubCupParameters follows the selected instrument's detectors
 

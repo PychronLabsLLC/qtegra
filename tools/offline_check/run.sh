@@ -17,6 +17,7 @@ trap 'rm -rf "$build"' EXIT
 
 # Qtegra compiles scripts with System and System.Threading in scope and provides
 # the instrument globals (HelixSFT etc.), which Stubs.cs declares on a partial class.
+# -langversion:4 keeps the script to C# 4, an assumption about the compiler Qtegra uses.
 {
     echo "using System; using System.Threading;"
     sed 's/^class RemoteControl[[:space:]]*$/partial class RemoteControl/' "$root/RemoteControlServer.cs"
@@ -27,7 +28,7 @@ for f in "$refs"/*.dll; do ref_args="$ref_args -r:$f"; done
 
 export DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_NOLOGO=1
 # shellcheck disable=SC2086
-"$dotnet" "$csc" -nologo -t:exe -main:DispatchTest -warnaserror \
+"$dotnet" "$csc" -nologo -t:exe -main:DispatchTest -warnaserror -langversion:4 \
     -nowarn:CS0067,CS0169,CS0414,CS0649,SYSLIB0006 \
     -out:"$build/check.dll" $ref_args \
     "$here/Stubs.cs" "$build/Script.cs" "$here/DispatchTest.cs"

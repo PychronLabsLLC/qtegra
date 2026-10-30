@@ -76,6 +76,10 @@ static class Config
     public static int magnet_steps=20; // number of steps to divide the total magnet displacement
     public static int magnet_step_time=100; //ms to delay between magnet steps
     public static bool probe_scan_data=true; // log the structure of the first scan received. also see ProbeScanData command
+    public static bool debug=false; // also log the polled commands (GetData, GetDataN, GetNextData, Ping)
+    public static int tcp_read_timeout=5000; // ms a TCP client has to send its command before the connection is closed
+    public static int tcp_idle_timeout=60000; // ms a KeepAlive connection may sit idle before it is closed
+    public static int request_id_window=10000; // ms during which a repeated "#id command" gets the cached reply instead of running again
 
 }
 
@@ -101,7 +105,12 @@ class RemoteControl
     public static IRMSBaseMeasurementInfo m_restoreMeasurementInfo;
 
     private static string SCAN_DATA;
+    private static long SCAN_COUNT=0; // number of scans received. guarded by m_lock, which is pulsed on every scan
     private static object m_lock=new object();
+
+    // hardware commands run one at a time, whichever client or thread they come from
+    private static object m_command_lock=new object();
+    private static List<TcpClient> TCP_CLIENTS=new List<TcpClient>();
 
 
 	private static List<string> DETECTOR_NAMES;
@@ -156,6 +165,12 @@ class RemoteControl
     //  Commands:
     //      GetVersion #version of this script
     //      Help #comma separated list of all commands
+    //      Ping #returns OK
+    //      GetDataN #<scan count>|<data>
+    //      GetNextData [timeout s] [scan count] #waits for a newer scan, returns <scan count>|<data> or Error: timeout
+    //      Subscribe #TCP only: the server writes <scan count>|<data> + newline for every scan until the client disconnects
+    //      KeepAlive #TCP only, first command: keep the connection open, newline terminated commands and replies
+    //      #<id> <command> #any command with an id: reply is #<id> <reply>
     //      GetTuningSettingsList #return a comma separated string
     //      SetTuningSettings <name>
     //      GetData returns tagged data e.g. H2,aaa,L1,bbb,CDD,ccc
@@ -221,7 +236,12 @@ class RemoteControl
 	private static string ParseAndExecuteCommand (string cmd)
 	{
 		string result;
-		Logger.Log(LogLevel.Debug, String.Format("Executing {0}", cmd));
+		string name = cmd.Trim().Split(' ')[0];
+		bool quiet = !Config.debug && QUIET_COMMANDS.Contains(name);
+		if (!quiet)
+		{
+			Logger.Log(LogLevel.Debug, String.Format("Executing {0}", cmd));
+		}
 		try
 		{
 			result = ExecuteCommand(cmd);
@@ -244,8 +264,72 @@ class RemoteControl
 		{
 			result = "Error: no result";
 		}
-		log(String.Format("{0} => {1}", cmd, result));
+		if (!quiet)
+		{
+			log(String.Format("{0} => {1}", cmd, result));
+		}
 		return result;
+	}
+
+	// A request may carry an id: "#<id> <command>" is answered "#<id> <reply>", so a client can match
+	// replies to requests. A repeat of the same id and command from the same client within
+	// Config.request_id_window ms (a UDP retry) gets the cached reply instead of running the command again.
+	private class CachedReply
+	{
+		public string Command;
+		public string Reply;
+		public DateTime Time;
+	}
+	private static Dictionary<string, CachedReply> m_replies=new Dictionary<string, CachedReply>();
+	private static Queue<string> m_reply_keys=new Queue<string>();
+
+	private static string HandleRequest(string raw, string client)
+	{
+		string msg = raw.Trim();
+		if (!msg.StartsWith("#"))
+		{
+			return ParseAndExecuteCommand(msg);
+		}
+
+		int sp = msg.IndexOf(' ');
+		if (sp < 0)
+		{
+			return String.Format("{0} Error: Invalid Command", msg);
+		}
+		string id = msg.Substring(0, sp);
+		string cmd = msg.Substring(sp+1).Trim();
+		string key = client + " " + id;
+
+		CachedReply cached;
+		lock(m_replies)
+		{
+			if (m_replies.TryGetValue(key, out cached) && cached.Command == cmd &&
+				(DateTime.UtcNow - cached.Time).TotalMilliseconds < Config.request_id_window)
+			{
+				Logger.Log(LogLevel.Debug, String.Format("Repeated request {0} {1}, sending cached reply", id, cmd));
+				return id + " " + cached.Reply;
+			}
+		}
+
+		string reply = ParseAndExecuteCommand(cmd);
+
+		lock(m_replies)
+		{
+			if (!m_replies.ContainsKey(key))
+			{
+				m_reply_keys.Enqueue(key);
+				if (m_reply_keys.Count > 256)
+				{
+					m_replies.Remove(m_reply_keys.Dequeue());
+				}
+			}
+			cached = new CachedReply();
+			cached.Command = cmd;
+			cached.Reply = reply;
+			cached.Time = DateTime.UtcNow;
+			m_replies[key] = cached;
+		}
+		return id + " " + reply;
 	}
 
 	// args: the command split on spaces, args[0] is the command name
@@ -254,6 +338,10 @@ class RemoteControl
 
 	private static Dictionary<string, CommandHandler> COMMANDS = new Dictionary<string, CommandHandler>();
 	private static List<string> COMMAND_NAMES = new List<string>();
+	// commands that do not touch the hardware, so they skip m_command_lock and answer straight away
+	private static List<string> QUICK_COMMANDS = new List<string>();
+	// polled commands, only logged when Config.debug is true
+	private static List<string> QUIET_COMMANDS = new List<string>(new string[]{"GetData", "GetDataN", "GetNextData", "Ping"});
 
 	private static void Register(string name, CommandHandler handler)
 	{
@@ -261,15 +349,25 @@ class RemoteControl
 		COMMAND_NAMES.Add(name);
 	}
 
+	private static void RegisterQuick(string name, CommandHandler handler)
+	{
+		Register(name, handler);
+		QUICK_COMMANDS.Add(name);
+	}
+
 	private static void RegisterCommands()
 	{
-		Register("GetVersion", (a, rest) => VERSION);
-		Register("Help", (a, rest) => String.Join(",", COMMAND_NAMES.ToArray()));
+		RegisterQuick("GetVersion", (a, rest) => VERSION);
+		RegisterQuick("Help", (a, rest) => String.Join(",", COMMAND_NAMES.ToArray()));
+		RegisterQuick("Ping", (a, rest) => "OK");
 
 		Register("GetTuningSettingsList", (a, rest) => GetTuningSettings());
 		Register("SetTuningSettings", (a, rest) => SetTuningSettings(a[1]) ? "OK" : String.Format("Error: could not set tuning settings {0}", a[1]));
-		Register("GetData", (a, rest) => SCAN_DATA ?? "Error: no data");
-		Register("ProbeScanData", (a, rest) => { PROBE_PENDING=true; return "OK"; });
+		RegisterQuick("GetData", (a, rest) => SCAN_DATA ?? "Error: no data");
+		RegisterQuick("GetDataN", (a, rest) => GetDataN());
+		RegisterQuick("GetNextData", (a, rest) => GetNextData(a));
+		RegisterQuick("Subscribe", (a, rest) => "Error: Subscribe needs a TCP connection");
+		RegisterQuick("ProbeScanData", (a, rest) => { PROBE_PENDING=true; return "OK"; });
 		Register("SetIntegrationTime", (a, rest) => SetIntegrationTime(ToDouble(a[1])));
 		Register("GetIntegrationTime", (a, rest) => GetIntegrationTime());
 		Register("BlankBeam", (a, rest) => BlankBeam(a[1]));
@@ -294,7 +392,7 @@ class RemoteControl
 		// Magnet
 		Register("GetMagnetDAC", (a, rest) => ReadParameter("Field Set", 1));
 		Register("SetMagnetDAC", (a, rest) => SetMagnetDAC(ToDouble(a[1])));
-		Register("GetMagnetMoving", (a, rest) => GetMagnetMoving());
+		RegisterQuick("GetMagnetMoving", (a, rest) => GetMagnetMoving());
 		Register("SetMass", (a, rest) =>
 		{
 			//Adapted from CSIRORemoteControlServer.cs
@@ -352,7 +450,49 @@ class RemoteControl
 			return "Error: Invalid Command";
 		}
 		string rest = String.Join(" ", Slice(args, 1, 0));
-		return handler(args, rest);
+		if (QUICK_COMMANDS.Contains(args[0]))
+		{
+			return handler(args, rest);
+		}
+		lock(m_command_lock)
+		{
+			return handler(args, rest);
+		}
+	}
+
+	// "<scan count>|<data>". the count goes up by one for every scan, so a client can tell new data from old
+	private static string GetDataN()
+	{
+		lock(m_lock)
+		{
+			if (SCAN_DATA == null)
+			{
+				return "Error: no data";
+			}
+			return String.Format("{0}|{1}", SCAN_COUNT, SCAN_DATA);
+		}
+	}
+
+	// GetNextData [timeout seconds, default 5] [scan count]
+	// waits for a scan newer than the given count (default: the latest scan now) and returns it like GetDataN
+	private static string GetNextData(string[] a)
+	{
+		double timeout = (a.Length > 1) ? ToDouble(a[1]) : 5;
+		lock(m_lock)
+		{
+			long after = (a.Length > 2) ? Int64.Parse(a[2], CultureInfo.InvariantCulture) : SCAN_COUNT;
+			DateTime end = DateTime.UtcNow.AddSeconds(timeout);
+			while (SCAN_COUNT <= after)
+			{
+				int left = (int)(end - DateTime.UtcNow).TotalMilliseconds;
+				if (left <= 0 || !RUNNING)
+				{
+					return "Error: timeout";
+				}
+				Monitor.Wait(m_lock, left);
+			}
+			return String.Format("{0}|{1}", SCAN_COUNT, SCAN_DATA);
+		}
 	}
 
 	private static string BlankBeam(string arg)
@@ -414,20 +554,39 @@ class RemoteControl
         // deattach the handler from the ScanDataAvailable Event
         Instrument.ScanDataAvailable-=ScanDataAvailable;
 
-        //shutdown the server. closing the socket unblocks the listen loop, which then sees RUNNING=false
+        //shutdown the server. the UDP loop wakes every 500 ms to check RUNNING; stopping the TCP listener
+        //unblocks the accept loop
         RUNNING=false;
-        if (UDP_SOCK != null)
-        {
-            UDP_SOCK.Close();
-        }
         if (TCPLISTENER != null)
         {
             TCPLISTENER.Stop();
         }
+        lock(TCP_CLIENTS)
+        {
+            foreach (TcpClient client in TCP_CLIENTS)
+            {
+                client.Close();
+            }
+        }
+        lock(m_lock)
+        {
+            Monitor.PulseAll(m_lock);
+        }
 
         if (SERVER_THREAD != null && !SERVER_THREAD.Join(2000))
         {
-            SERVER_THREAD.Abort();
+            try
+            {
+                SERVER_THREAD.Abort();
+            }
+            catch (Exception)
+            {
+            }
+        }
+        // closed after the loop has stopped: closing a socket that another thread is reading can block
+        if (UDP_SOCK != null)
+        {
+            UDP_SOCK.Close();
         }
 
     }
@@ -978,6 +1137,8 @@ class RemoteControl
 			}
 			data.Reverse();
 			SCAN_DATA=string.Join(",",data.ToArray());
+			SCAN_COUNT++;
+			Monitor.PulseAll(m_lock); // wake GetNextData and Subscribe
 		}
 	}
 
@@ -1253,7 +1414,17 @@ class RemoteControl
 
         IPEndPoint ipep = new IPEndPoint(IPAddress.Any, Config.port);
         UDP_SOCK = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+        try
+        {
+            // Windows: stop a reply to a client that has gone away from making the next ReceiveFrom fail
+            const int SIO_UDP_CONNRESET = -1744830452;
+            UDP_SOCK.IOControl(SIO_UDP_CONNRESET, new byte[]{0, 0, 0, 0}, null);
+        }
+        catch (Exception)
+        {
+        }
         UDP_SOCK.Bind(ipep);
+        UDP_SOCK.ReceiveTimeout = 500; // wake up regularly to check RUNNING
 
         IPEndPoint sender = new IPEndPoint(IPAddress.Any, 0);
         EndPoint remote = (EndPoint)(sender);
@@ -1265,11 +1436,16 @@ class RemoteControl
                 recv=UDP_SOCK.ReceiveFrom(data, ref remote);
                 string rdata = Encoding.ASCII.GetString(data,0, recv);
 
-                string result = ParseAndExecuteCommand(rdata.Trim());
+                string result = HandleRequest(rdata, remote.ToString());
 
                 //Logger.Log(LogLevel.Debug, String.Format("Sending back {0}", result));
                 UDP_SOCK.SendTo(Encoding.ASCII.GetBytes(result), remote);
             } catch (Exception e) {
+                SocketException se = e as SocketException;
+                if (se != null && se.SocketErrorCode == SocketError.TimedOut)
+                {
+                    continue; // nothing received in the last 500 ms
+                }
                 if (!RUNNING)
                 {
                     break;
@@ -1288,7 +1464,11 @@ class RemoteControl
         while (RUNNING) {
             try
             {
-                TCPHandle(TCPLISTENER.AcceptTcpClient ());
+                // one thread per connection, so a slow or silent client does not block the others
+                TcpClient client = TCPLISTENER.AcceptTcpClient ();
+                Thread clientThread = new Thread (delegate() { TCPHandle(client); });
+                clientThread.IsBackground = true;
+                clientThread.Start ();
             }
             catch (Exception e)
             {
@@ -1296,31 +1476,113 @@ class RemoteControl
                 {
                     break;
                 }
-                Logger.Log(LogLevel.Warning, String.Format("TCP client failed. {0}", e));
+                Logger.Log(LogLevel.Warning, String.Format("TCP accept failed. {0}", e));
             }
-
-            //TcpClient client = TCPLISTENER.AcceptTcpClient ();
-            //Thread clientThread = new Thread (new ParameterizedThreadStart (TCPHandle));
-            //clientThread.Start (client);
         }
     }
 
+    // A connection handles one command and is closed after the reply, as clients have always used it,
+    // unless the first command is
+    //    KeepAlive  - reply "OK\n", then handle newline terminated commands, each answered with reply + "\n",
+    //                 until the client disconnects or is idle for Config.tcp_idle_timeout ms
+    //    Subscribe  - write "<scan count>|<data>\n" for every scan until the client disconnects
     private static void TCPHandle (TcpClient tcpClient)
     {
-        //TcpClient tcpClient = (TcpClient)client;
-
+        lock(TCP_CLIENTS)
+        {
+            TCP_CLIENTS.Add(tcpClient);
+        }
         try
         {
-            NetworkStream _stream = tcpClient.GetStream ();
-            //string response = Read (_stream);
+            tcpClient.ReceiveTimeout = Config.tcp_read_timeout;
+            tcpClient.SendTimeout = Config.tcp_read_timeout;
+            NetworkStream stream = tcpClient.GetStream ();
+            string client = tcpClient.Client.RemoteEndPoint.ToString();
 
-            string result = ParseAndExecuteCommand (TCPRead(_stream).Trim());
+            string first = TCPRead(stream);
+            if (first.Length == 0)
+            {
+                return;
+            }
 
-            TCPWrite(_stream, result);
+            int nl = first.IndexOf('\n');
+            string firstcmd = ((nl < 0) ? first : first.Substring(0, nl)).Trim();
+            if (firstcmd == "KeepAlive")
+            {
+                TCPWrite(stream, "OK\n");
+                tcpClient.ReceiveTimeout = Config.tcp_idle_timeout;
+                TCPKeepAlive(stream, client, new StringBuilder((nl < 0) ? "" : first.Substring(nl + 1)));
+            }
+            else if (firstcmd == "Subscribe")
+            {
+                TCPSubscribe(stream);
+            }
+            else
+            {
+                TCPWrite(stream, HandleRequest(first, client));
+            }
+        }
+        catch (Exception e)
+        {
+            // timeouts and clients going away end up here
+            Logger.Log(LogLevel.Debug, String.Format("TCP connection closed. {0}", e.Message));
         }
         finally
         {
+            lock(TCP_CLIENTS)
+            {
+                TCP_CLIENTS.Remove(tcpClient);
+            }
             tcpClient.Close();
+        }
+    }
+
+    private static void TCPKeepAlive (NetworkStream stream, string client, StringBuilder buffer)
+    {
+        string line;
+        while (RUNNING && (line = TCPReadLine(stream, buffer)) != null)
+        {
+            line = line.Trim();
+            if (line.Length == 0)
+            {
+                continue;
+            }
+            if (line == "Subscribe")
+            {
+                TCPSubscribe(stream);
+                return;
+            }
+            TCPWrite(stream, HandleRequest(line, client) + "\n");
+        }
+    }
+
+    private static void TCPSubscribe (NetworkStream stream)
+    {
+        long last;
+        lock(m_lock)
+        {
+            last = SCAN_COUNT;
+        }
+        while (RUNNING)
+        {
+            string line = null;
+            lock(m_lock)
+            {
+                if (SCAN_COUNT <= last)
+                {
+                    Monitor.Wait(m_lock, 1000);
+                }
+                if (SCAN_COUNT > last)
+                {
+                    last = SCAN_COUNT;
+                    line = String.Format("{0}|{1}\n", SCAN_COUNT, SCAN_DATA);
+                }
+            }
+            if (line != null)
+            {
+                // throws once the client has gone away, which ends the subscription
+                TCPWrite(stream, line);
+            }
         }
     }
     //====================================================================================================================================
@@ -1335,29 +1597,42 @@ class RemoteControl
         }
     }
 
+    // read whatever the client has sent so far. "" if the client closed the connection
     private static string TCPRead (NetworkStream stream)
     {
-        int BufferSize = 1024;
-        byte[] data = new byte[BufferSize];
-        try {
-            StringBuilder myCompleteMessage = new StringBuilder ();
-            int numberOfBytesRead = 0;
+        byte[] data = new byte[1024];
+        StringBuilder myCompleteMessage = new StringBuilder ();
+        int numberOfBytesRead = 0;
 
-            // Incoming message may be larger than the buffer size.
-            do {
-                numberOfBytesRead = stream.Read (data, 0, data.Length);
+        // Incoming message may be larger than the buffer size.
+        do {
+            numberOfBytesRead = stream.Read (data, 0, data.Length);
+            myCompleteMessage.Append (Encoding.ASCII.GetString (data, 0, numberOfBytesRead));
+        } while (numberOfBytesRead > 0 && stream.DataAvailable);
 
-                myCompleteMessage.AppendFormat ("{0}", Encoding.ASCII.GetString (data, 0, numberOfBytesRead));
-            } while (stream.DataAvailable);
+        return myCompleteMessage.ToString ();
+    }
 
-            //string rd = string.Format ("Read Data: {0} the received text is '{1}'", numberOfBytesRead, myCompleteMessage);
-
-            return myCompleteMessage.ToString ();
-        } catch (Exception e) {
-            string error = string.Format ("Could not read from the NetworkStream. {0}", e.ToString ());
-            Logger.Log(LogLevel.Warning, error);
+    // next newline terminated line, using buffer for data already received. null if the client closed the connection
+    private static string TCPReadLine (NetworkStream stream, StringBuilder buffer)
+    {
+        byte[] data = new byte[1024];
+        while (true)
+        {
+            string pending = buffer.ToString();
+            int nl = pending.IndexOf('\n');
+            if (nl >= 0)
+            {
+                buffer.Remove(0, nl + 1);
+                return pending.Substring(0, nl);
+            }
+            int n = stream.Read(data, 0, data.Length);
+            if (n == 0)
+            {
+                return null;
+            }
+            buffer.Append(Encoding.ASCII.GetString(data, 0, n));
         }
-        return string.Empty;
     }
 
 

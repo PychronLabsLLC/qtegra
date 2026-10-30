@@ -3,6 +3,13 @@ Commands are case sensitive and in CamelCase. Do not include the "<" or ">".
 Numbers use "." as the decimal separator.
 Send "Help" to a running server for the list of commands it supports.
 
+Request ids: "#<id> <command>" is answered "#<id> <reply>". A repeat of the same
+id and command from the same client within Config.request_id_window ms gets the
+cached reply without running the command again.
+
+TCP: one command per connection, unless the first command is KeepAlive
+(connection stays open, newline terminated commands and replies) or Subscribe.
+
 Error Responses:
     Error: Invalid Command                  the command does not exist
     Error: missing argument for <cmd>
@@ -10,6 +17,7 @@ Error Responses:
     Error: could not set <name> to <value>
     Error: could not read <name>
     Error: magnet is moving                 a SetMagnetDAC/SetMass move is still running
+    Error: timeout                          GetNextData saw no new scan in time
     Error: <message>                        anything else that went wrong
 
 Command	Arguments	Returns	Note
@@ -17,8 +25,13 @@ Command	Arguments	Returns	Note
 ===========General================================================
 GetVersion		20.2
 Help		comma separated command names
+Ping		OK
 GetData		see note	tag_data=true: name,value pairs e.g. H2,aaa,L1,bbb,CDD,ccc
 				tag_data=false: values only. "Error: no data" before the first scan
+GetDataN		<scan count>|<data>	"Error: no data" before the first scan
+GetNextData	[timeout s] [scan count]	<scan count>|<data>	waits for a scan newer than scan count (default: latest). timeout default 5 s
+Subscribe		see note	TCP only: "<scan count>|<data>" + newline for every scan until the client disconnects
+KeepAlive		OK	TCP only, first command: keep the connection open
 ProbeScanData		OK	log the structure of the next scan to the Qtegra log (diagnostic)
 GetTuningSettingsList		comma separated names
 SetTuningSettings	name	OK,Error

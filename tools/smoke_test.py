@@ -55,7 +55,11 @@ def build_checks(detectors):
     checks = [
         ("GetVersion", ok_reply, "version string"),
         ("Help", lambda r: "GetData" in r.split(","), "command list includes GetData"),
+        ("Ping", lambda r: r == "OK", "OK"),
+        ("#7 Ping", lambda r: r == "#7 OK", "reply tagged with the request id"),
         ("GetData", lambda r: ok_reply(r) or r == "Error: no data", "scan data or no data yet"),
+        ("GetDataN", lambda r: r.split("|")[0].isdigit() or r == "Error: no data", "<count>|<data>"),
+        ("GetNextData 5", lambda r: r.split("|")[0].isdigit(), "a new scan within 5 s (is the monitor scan running?)"),
         ("GetIntegrationTime", is_number, "number"),
         ("GetTuningSettingsList", ok_reply, "tune settings"),
         ("GetCupConfigurationList", ok_reply, "cup configurations"),
@@ -79,6 +83,22 @@ def build_checks(detectors):
         checks.append(("GetDeflection " + det, is_number, "number"))
         checks.append(("GetGain " + det, is_number, "number"))
     return checks
+
+
+def check_keepalive(host, port, timeout):
+    """KeepAlive connection: several newline terminated commands on one connection. Returns failures."""
+    expected = ["OK", "OK", "#2 OK"]
+    try:
+        with socket.create_connection((host, port), timeout=timeout) as s:
+            f = s.makefile("rw", encoding="ascii", newline="\n")
+            f.write("KeepAlive\nPing\n#2 Ping\n")
+            f.flush()
+            replies = [f.readline().rstrip("\n") for _ in expected]
+    except OSError as e:
+        replies = ["<{}>".format(e)]
+    passed = replies == expected
+    print("{:4} {:40} {}".format("ok" if passed else "FAIL", "KeepAlive, Ping, #2 Ping", replies))
+    return 0 if passed else 1
 
 
 def main():
@@ -105,6 +125,9 @@ def main():
             failures += 1
         print("{:4} {:40} {:.80}{}".format("ok" if passed else "FAIL", cmd, reply,
                                           "" if passed else "   (expected {})".format(expected)))
+
+    if args.tcp:
+        failures += check_keepalive(args.host, args.port, args.timeout)
 
     print("\n{} failed".format(failures) if failures else "\nall passed")
     return 1 if failures else 0

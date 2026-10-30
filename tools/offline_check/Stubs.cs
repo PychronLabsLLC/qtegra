@@ -57,7 +57,8 @@ namespace Thermo.Imhotep.BasicHardware
     }
     public class CupConfigurationDataList : List<IRMSBaseCupConfigurationData>
     {
-        public IRMSBaseCupConfigurationData GetActiveCupConfiguration() { return null; }
+        public IRMSBaseCupConfigurationData Active;
+        public IRMSBaseCupConfigurationData GetActiveCupConfiguration() { return Active; }
         public IRMSBaseSubCupConfigurationData GetActiveSubCupConfiguration() { return null; }
         public IRMSBaseCupConfigurationData FindCupConfigurationByName(string n) { return null; }
         public void SetActiveItem(object a, object b, object c, object d) {}

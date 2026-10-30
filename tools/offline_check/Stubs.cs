@@ -85,7 +85,7 @@ namespace Thermo.Imhotep.BasicHardware
         public List<UFCCalibrationData> UFCCalibrationData; public TuneParameters TuneParameters;
         public BaseSettingsData BaseSettingsData;
         public event EventHandler<EventArgs<Spectrum>> ScanDataAvailable;
-        public bool GetParameter(string n, out double v) { v = 0; return true; }
+        public bool GetParameter(string n, out double v) { v = 0; return !n.StartsWith("Nope"); } // names starting "Nope" do not exist
         public bool SetParameter(string n, double v) { return true; }
         public bool SetParameter(string n, int v) { return true; }
         public void SetHardwareParameters(object a, object b) {}

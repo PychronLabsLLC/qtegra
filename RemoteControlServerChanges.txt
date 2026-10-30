@@ -55,6 +55,11 @@ protocol
     newline terminated) and Subscribe (server pushes every scan)
     hardware commands run one at a time; state-only commands answer at once
     Config.debug: polled commands are only logged when set
+    every command is defined once with its arguments, reply and description;
+    Help <command> and PROTOCOL.md are generated from that. rcs_protocol.txt
+    is replaced by PROTOCOL.md
+    added CheckParameters and ProbeInstrument for finding parameter names;
+    GetParameters accepts names with spaces
     commands are registered in a table (RegisterCommands) instead of a switch
     GetSubCupParameters follows the selected instrument's detectors
 

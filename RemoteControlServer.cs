@@ -157,81 +157,7 @@ class RemoteControl
 
     }
 
-    //====================================================================================================================================
-    //
-    //  Commands are case sensitive and in CamelCase
-    //  do not include the "<" or ">" in the commands.
-    //  e.g SetTrapVoltage 120 not SetTrapVoltage <120>
-    //  Commands:
-    //      GetVersion #version of this script
-    //      Help #comma separated list of all commands
-    //      Ping #returns OK
-    //      GetDataN #<scan count>|<data>
-    //      GetNextData [timeout s] [scan count] #waits for a newer scan, returns <scan count>|<data> or Error: timeout
-    //      Subscribe #TCP only: the server writes <scan count>|<data> + newline for every scan until the client disconnects
-    //      KeepAlive #TCP only, first command: keep the connection open, newline terminated commands and replies
-    //      #<id> <command> #any command with an id: reply is #<id> <reply>
-    //      GetTuningSettingsList #return a comma separated string
-    //      SetTuningSettings <name>
-    //      GetData returns tagged data e.g. H2,aaa,L1,bbb,CDD,ccc
-    //      ProbeScanData #log the structure of the next scan to the Qtegra log (diagnostic)
-    //      SetIntegrationTime <seconds>
-    //      GetIntegrationTime <seconds>
-    //      BlankBeam <true or false> if true set y-symmetry to -50 else return to previous value
-
-    //===========Cup/SubCup Configurations==============================
-    //      GetCupConfigurationList
-    //      GetSubCupConfigurationList <cup name>
-    //      GetActiveCupConfiguration
-    //      GetActiveSubCupConfiguration
-    //      GetSubCupParameters returns list of Deflection voltages and the Ion Counter supply voltage
-    //      ActivateCupConfiguration <cup name> <sub cup name>
-
-    //===========Ion Counter============================================
-    //      ActivateIonCounter <detname>
-    //      DeactivateIonCounter <detname>
-
-    //===========Ion Pump Valve=========================================
-    //      Open <name>  #open the Ion pump to the mass spec
-    //      Close <name> #closes the Ion pump to the mass spec
-    //      GetValveState <name> #returns True for open false for close
-
-    //===========Magnet=================================================
-    //      GetMagnetDAC
-    //      SetMagnetDAC <value> #0-10V
-    //      GetMagnetMoving
-    //      @SetMass <value>,<string cupName> #deactivates the CDDs if they are active
-
-    //===========Source=================================================
-    //      GetHighVoltage #V
-    //      SetHighVoltage <V>
-    //      GetHV #kV
-    //      SetHV <V>  NOTE: GetHV returns kV but SetHV takes V
-
-    //==========Detectors===============================================
-    //      @ActivateAllCDDs #activates and unprotects all CDDs with a mass in the CupConfiguration
-	//      @DeactivateAllCDDs #deactivates and protects all CDDs
-    //      ProtectDetector <name>,<On/Off>
-	//      GetDeflection <name>
-	//      SetDeflection <name>,<value>
-	//      GetIonCounterVoltage
-	//      SetIonCounterVoltage <value>
-	//      GetGain <name>
-	//      SetGain <name>,<value>
-	//      GetDeflections <name>[,<name>,...]
-
-	//==================================================================
-	//		Error Responses:
-	//			Error: Invalid Command   - the command is poorly formated or does not exist.
-	//			Error: could not set <hardware> to <value>
-	//			Error: could not read <hardware>
-	//			Error: missing argument for <cmd> / Error: invalid number in <cmd>
-
-     //==========Generic Device===============================================
-	//      GetParameter <name> -  name is any valid device currently listed in the hardware database
-	//      SetParameter <name>,<value> -  name is any valid device currently listed in the hardware database
-	//      GetParameters <name>[,<name>,...]
-	//====================================================================================================================================
+    // Commands are defined in RegisterCommands. PROTOCOL.md is generated from those definitions.
 
 	private static string ParseAndExecuteCommand (string cmd)
 	{
@@ -336,127 +262,228 @@ class RemoteControl
 	// rest: everything after the command name, rejoined with single spaces
 	private delegate string CommandHandler(string[] args, string rest);
 
-	private static Dictionary<string, CommandHandler> COMMANDS = new Dictionary<string, CommandHandler>();
-	private static List<string> COMMAND_NAMES = new List<string>();
-	// commands that do not touch the hardware, so they skip m_command_lock and answer straight away
-	private static List<string> QUICK_COMMANDS = new List<string>();
+	// Every command is defined once, in RegisterCommands, with its arguments, reply and description.
+	// "Help", "Help <command>" and PROTOCOL.md (tools/offline_check/run.sh --update-protocol) come from these.
+	private class CommandInfo
+	{
+		public string Name;
+		public string Section;
+		public string Args;
+		public string Returns;
+		public string Description;
+		public bool Quick; // does not touch the hardware: skips m_command_lock and answers straight away
+		public CommandHandler Handler;
+	}
+
+	private static Dictionary<string, CommandInfo> COMMANDS = new Dictionary<string, CommandInfo>();
+	private static List<CommandInfo> COMMAND_LIST = new List<CommandInfo>();
+	private static string SECTION = "";
 	// polled commands, only logged when Config.debug is true
 	private static List<string> QUIET_COMMANDS = new List<string>(new string[]{"GetData", "GetDataN", "GetNextData", "Ping"});
 
-	private static void Register(string name, CommandHandler handler)
+	private static void Section(string name)
 	{
-		COMMANDS[name] = handler;
-		COMMAND_NAMES.Add(name);
+		SECTION = name;
 	}
 
-	private static void RegisterQuick(string name, CommandHandler handler)
+	private static void Register(string name, string args, string returns, string description, CommandHandler handler)
 	{
-		Register(name, handler);
-		QUICK_COMMANDS.Add(name);
+		Add(name, args, returns, description, handler, false);
+	}
+
+	private static void RegisterQuick(string name, string args, string returns, string description, CommandHandler handler)
+	{
+		Add(name, args, returns, description, handler, true);
+	}
+
+	private static void Add(string name, string args, string returns, string description, CommandHandler handler, bool quick)
+	{
+		CommandInfo info = new CommandInfo();
+		info.Name = name;
+		info.Section = SECTION;
+		info.Args = args;
+		info.Returns = returns;
+		info.Description = description;
+		info.Quick = quick;
+		info.Handler = handler;
+		COMMANDS[name] = info;
+		COMMAND_LIST.Add(info);
+	}
+
+	private static string Help(string name)
+	{
+		if (name.Length == 0)
+		{
+			List<string> names = new List<string>();
+			foreach (CommandInfo c in COMMAND_LIST)
+			{
+				names.Add(c.Name);
+			}
+			return String.Join(",", names.ToArray());
+		}
+		CommandInfo info;
+		if (!COMMANDS.TryGetValue(name, out info))
+		{
+			return String.Format("Error: unknown command {0}", name);
+		}
+		return String.Format("{0}{1} -> {2}. {3}", info.Name, (info.Args.Length > 0) ? " " + info.Args : "", info.Returns, info.Description);
 	}
 
 	private static void RegisterCommands()
 	{
-		RegisterQuick("GetVersion", (a, rest) => VERSION);
-		RegisterQuick("Help", (a, rest) => String.Join(",", COMMAND_NAMES.ToArray()));
-		RegisterQuick("Ping", (a, rest) => "OK");
+		Section("General");
+		RegisterQuick("GetVersion", "", "<version>", "Version of this script.",
+			(a, rest) => VERSION);
+		RegisterQuick("Help", "[<command>]", "<command>,<command>,... | <usage>", "All command names, or the usage of one command.",
+			(a, rest) => Help(rest));
+		RegisterQuick("Ping", "", "OK", "Check that the server is answering.",
+			(a, rest) => "OK");
+		RegisterQuick("KeepAlive", "", "OK", "TCP only, and only as the first command on a connection: keep the connection open for newline terminated commands and replies.",
+			(a, rest) => "Error: KeepAlive must be the first command on a TCP connection");
+		Register("GetTuningSettingsList", "", "<name>,<name>,...", "Saved tune settings.",
+			(a, rest) => GetTuningSettings());
+		Register("SetTuningSettings", "<name>", "OK | Error", "Load a saved tune setting.",
+			(a, rest) => SetTuningSettings(a[1]) ? "OK" : String.Format("Error: could not set tuning settings {0}", a[1]));
+		Register("GetIntegrationTime", "", "<seconds>", "Integration time of the monitor scan.",
+			(a, rest) => GetIntegrationTime());
+		Register("SetIntegrationTime", "<seconds>", "OK | Error", "Restart the monitor scan with a new integration time.",
+			(a, rest) => SetIntegrationTime(ToDouble(a[1])));
+		Register("BlankBeam", "true | false", "OK | Error", "true remembers Y-Symmetry and sets it to -50, false restores it. Does nothing when Config.use_beam_blank is false.",
+			(a, rest) => BlankBeam(a[1]));
 
-		Register("GetTuningSettingsList", (a, rest) => GetTuningSettings());
-		Register("SetTuningSettings", (a, rest) => SetTuningSettings(a[1]) ? "OK" : String.Format("Error: could not set tuning settings {0}", a[1]));
-		RegisterQuick("GetData", (a, rest) => SCAN_DATA ?? "Error: no data");
-		RegisterQuick("GetDataN", (a, rest) => GetDataN());
-		RegisterQuick("GetNextData", (a, rest) => GetNextData(a));
-		RegisterQuick("Subscribe", (a, rest) => "Error: Subscribe needs a TCP connection");
-		RegisterQuick("ProbeScanData", (a, rest) => { PROBE_PENDING=true; return "OK"; });
-		Register("SetIntegrationTime", (a, rest) => SetIntegrationTime(ToDouble(a[1])));
-		Register("GetIntegrationTime", (a, rest) => GetIntegrationTime());
-		Register("BlankBeam", (a, rest) => BlankBeam(a[1]));
+		Section("Scan data");
+		RegisterQuick("GetData", "", "<name>,<value>,... | <value>,...", "Latest scan. Name,value pairs when Config.tag_data is true, values only when false. \"Error: no data\" before the first scan.",
+			(a, rest) => SCAN_DATA ?? "Error: no data");
+		RegisterQuick("GetDataN", "", "<scan count>|<data>", "Latest scan with its scan count, which goes up by one for every scan. <data> is as for GetData.",
+			(a, rest) => GetDataN());
+		RegisterQuick("GetNextData", "[<timeout s>] [<scan count>]", "<scan count>|<data> | Error: timeout", "Wait for a scan newer than <scan count> (default: the latest scan now). Timeout defaults to 5 s. Over UDP this holds up other commands while it waits.",
+			(a, rest) => GetNextData(a));
+		RegisterQuick("Subscribe", "", "<scan count>|<data> per scan", "TCP only: the server writes one line per scan until the client disconnects. Allowed as the first command or after KeepAlive.",
+			(a, rest) => "Error: Subscribe needs a TCP connection");
+		RegisterQuick("ProbeScanData", "", "OK", "Diagnostic: log the structure of the next scan to the Qtegra log.",
+			(a, rest) => { PROBE_PENDING=true; return "OK"; });
 
-		// Cup / SubCup Configurations
-		Register("GetCupConfigurationList", (a, rest) => string.Join("\r", GetCupConfigurations().ToArray()));
-		Register("GetSubCupConfigurationList", (a, rest) => GetSubCupConfigurationList(a[1]));
-		Register("GetActiveCupConfiguration", (a, rest) => Instrument.CupConfigurationDataList.GetActiveCupConfiguration().Name);
-		Register("GetActiveSubCupConfiguration", (a, rest) => Instrument.CupConfigurationDataList.GetActiveSubCupConfiguration().Name);
-		Register("GetSubCupParameters", (a, rest) => GetSubCupParameters());
-		Register("ActivateCupConfiguration", (a, rest) => mActivateCup(a[1], a[2]));
+		Section("Cup and sub cup configurations");
+		Register("GetCupConfigurationList", "", "<name>\\r<name>...", "Cup configuration names, separated by carriage returns.",
+			(a, rest) => string.Join("\r", GetCupConfigurations().ToArray()));
+		Register("GetSubCupConfigurationList", "<cup name>", "<name>\\r<name>...", "Sub cup configuration names of a cup configuration.",
+			(a, rest) => GetSubCupConfigurationList(a[1]));
+		Register("GetActiveCupConfiguration", "", "<name>", "",
+			(a, rest) => Instrument.CupConfigurationDataList.GetActiveCupConfiguration().Name);
+		Register("GetActiveSubCupConfiguration", "", "<name>", "",
+			(a, rest) => Instrument.CupConfigurationDataList.GetActiveSubCupConfiguration().Name);
+		Register("GetSubCupParameters", "", "<parameter>,<value>;...", "Deflection of each detector of the selected instrument, then CDD Supply Set. Unreadable parameters are left out.",
+			(a, rest) => GetSubCupParameters());
+		Register("ActivateCupConfiguration", "<cup name> <sub cup name>", "OK | Error", "Names cannot contain spaces.",
+			(a, rest) => mActivateCup(a[1], a[2]));
 
-		// Ion Counter
-		Register("ActivateIonCounter", (a, rest) => SetIonCounterState(a[1], true));
-		Register("DeactivateIonCounter", (a, rest) => SetIonCounterState(a[1], false));
+		Section("Ion counters (CDD)");
+		Register("ActivateIonCounter", "<detector>", "OK | Error", "Activate and unprotect one CDD, then restart the monitor scan.",
+			(a, rest) => SetIonCounterState(a[1], true));
+		Register("DeactivateIonCounter", "<detector>", "OK | Error", "Deactivate and protect one CDD, then restart the monitor scan.",
+			(a, rest) => SetIonCounterState(a[1], false));
+		Register("ActivateAllCDDs", "", "OK | Error", "Activate and unprotect every CDD with a mass in the active cup configuration.",
+			(a, rest) => ActivateAllCDDs());
+		Register("DeactivateAllCDDs", "", "OK | Error", "Deactivate and protect all CDDs.",
+			(a, rest) => DeactivateAllCDDs());
 
-		// Ion Pump Valve
-		Register("Open", (a, rest) => SetParameter(rest, OPEN));
-		Register("Close", (a, rest) => SetParameter(rest, CLOSE));
-		Register("GetValveState", (a, rest) => GetValveState(rest));
+		Section("Valves");
+		Register("Open", "<valve>", "OK | Error", "Set the valve parameter to 1, e.g. Open Valve Ion Pump Set.",
+			(a, rest) => SetParameter(rest, OPEN));
+		Register("Close", "<valve>", "OK | Error", "Set the valve parameter to 0.",
+			(a, rest) => SetParameter(rest, CLOSE));
+		Register("GetValveState", "<valve>", "True | False | Error", "True when open.",
+			(a, rest) => GetValveState(rest));
 
-		// Magnet
-		Register("GetMagnetDAC", (a, rest) => ReadParameter("Field Set", 1));
-		Register("SetMagnetDAC", (a, rest) => SetMagnetDAC(ToDouble(a[1])));
-		RegisterQuick("GetMagnetMoving", (a, rest) => GetMagnetMoving());
-		Register("SetMass", (a, rest) =>
-		{
-			//Adapted from CSIRORemoteControlServer.cs
-			string[] p = rest.Split(',');
-			return SetMass(ToDouble(p[0]), (p.Length>1) ? p[1] : null);
-		});
+		Section("Magnet");
+		Register("GetMagnetDAC", "", "<value>", "Field Set, 0-10 V.",
+			(a, rest) => ReadParameter("Field Set", 1));
+		Register("SetMagnetDAC", "<value>", "OK | Error", "Set Field Set, 0-10 V. Moves larger than Config.magnet_move_threshold are stepped in the background: poll GetMagnetMoving.",
+			(a, rest) => SetMagnetDAC(ToDouble(a[1])));
+		RegisterQuick("GetMagnetMoving", "", "True | False", "True while a SetMagnetDAC or SetMass move is running.",
+			(a, rest) => GetMagnetMoving());
+		Register("SetMass", "<mass>[,<cup>]", "OK | Error", "Put <mass> on <cup> (default AX). Deactivates the CDDs first; large moves are stepped.",
+			(a, rest) =>
+			{
+				//Adapted from CSIRORemoteControlServer.cs
+				string[] p = rest.Split(',');
+				return SetMass(ToDouble(p[0]), (p.Length>1) ? p[1] : null);
+			});
 
-		// Source Parameters
-		Register("GetHighVoltage", (a, rest) => ReadParameter("Acceleration Reference Set", 1000));
-		Register("SetHighVoltage", (a, rest) => SetParameter("Acceleration Reference Set", ToDouble(a[1])/1000.0));
-		Register("GetHV", (a, rest) => ReadParameter("Acceleration Reference Set", 1));
-		Register("SetHV", (a, rest) => SetParameter("Acceleration Reference Set", ToDouble(a[1])/1000.0));
+		Section("Source");
+		Register("GetHighVoltage", "", "<V>", "Acceleration Reference Set in V.",
+			(a, rest) => ReadParameter("Acceleration Reference Set", 1000));
+		Register("SetHighVoltage", "<V>", "OK | Error", "",
+			(a, rest) => SetParameter("Acceleration Reference Set", ToDouble(a[1])/1000.0));
+		Register("GetHV", "", "<kV>", "Acceleration Reference Set in kV. Note: SetHV takes V.",
+			(a, rest) => ReadParameter("Acceleration Reference Set", 1));
+		Register("SetHV", "<V>", "OK | Error", "Same as SetHighVoltage. Note: takes V although GetHV returns kV.",
+			(a, rest) => SetParameter("Acceleration Reference Set", ToDouble(a[1])/1000.0));
 
-		// Detectors
-		Register("ProtectDetector", (a, rest) =>
-		{
-			string[] p = a[1].Split(',');
-			ProtectDetector(p[0], p[1]);
-			return "OK";
-		});
-		Register("GetDeflection", (a, rest) => ReadParameter(String.Format("Deflection {0} Set", rest), 1));
-		Register("SetDeflection", (a, rest) =>
-		{
-			string[] p = rest.Split(',');
-			return SetParameter(String.Format("Deflection {0} Set", p[0]), ToDouble(p[1]));
-		});
-		Register("GetDeflections", (a, rest) => GetDeflections(a));
-		Register("GetIonCounterVoltage", (a, rest) => ReadParameter("CDD Supply Set", 1));
-		Register("SetIonCounterVoltage", (a, rest) => SetParameter("CDD Supply Set", ToDouble(a[1])));
-		Register("GetGain", (a, rest) => GetGain(rest));
-		Register("SetGain", (a, rest) =>
-		{
-			string[] p = rest.Split(',');
-			return SetGain(p[0], ToDouble(p[1]));
-		});
-		Register("ActivateAllCDDs", (a, rest) => ActivateAllCDDs());
-		Register("DeactivateAllCDDs", (a, rest) => DeactivateAllCDDs());
+		Section("Detectors");
+		Register("ProtectDetector", "<detector>,On | Off", "OK", "On saves the deflection and sets it to 2000, Off restores it.",
+			(a, rest) =>
+			{
+				string[] p = a[1].Split(',');
+				ProtectDetector(p[0], p[1]);
+				return "OK";
+			});
+		Register("GetDeflection", "<detector>", "<value> | Error", "Deflection <detector> Set.",
+			(a, rest) => ReadParameter(String.Format("Deflection {0} Set", rest), 1));
+		Register("SetDeflection", "<detector>,<value>", "OK | Error", "",
+			(a, rest) =>
+			{
+				string[] p = rest.Split(',');
+				return SetParameter(String.Format("Deflection {0} Set", p[0]), ToDouble(p[1]));
+			});
+		Register("GetDeflections", "<detector>[,<detector>...]", "<value>,<value>,...", "0 for a deflection that cannot be read.",
+			(a, rest) => GetDeflections(a));
+		Register("GetIonCounterVoltage", "", "<value> | Error", "CDD Supply Set.",
+			(a, rest) => ReadParameter("CDD Supply Set", 1));
+		Register("SetIonCounterVoltage", "<value>", "OK | Error", "",
+			(a, rest) => SetParameter("CDD Supply Set", ToDouble(a[1])));
+		Register("GetGain", "<detector>", "<value> | Error", "Detector gain from the calibration data.",
+			(a, rest) => GetGain(rest));
+		Register("SetGain", "<detector>,<value>", "OK | Error", "",
+			(a, rest) =>
+			{
+				string[] p = rest.Split(',');
+				return SetGain(p[0], ToDouble(p[1]));
+			});
 
-		// Generic
-		Register("GetParameter", (a, rest) => ReadParameter(rest, 1));
-		Register("SetParameter", (a, rest) =>
-		{
-			string[] p = rest.Split(',');
-			return SetParameter(p[0], ToDouble(p[1]));
-		});
-		Register("GetParameters", (a, rest) => GetParameters(a));
+		Section("Hardware parameters");
+		Register("GetParameter", "<parameter>", "<value> | Error", "Any item in the instrument's hardware database, e.g. Field Set. See \"Finding parameter names\".",
+			(a, rest) => ReadParameter(rest, 1));
+		Register("SetParameter", "<parameter>,<value>", "OK | Error", "",
+			(a, rest) =>
+			{
+				string[] p = rest.Split(',');
+				return SetParameter(p[0], ToDouble(p[1]));
+			});
+		Register("GetParameters", "<parameter>[,<parameter>...]", "<value>,<value>,...", "0 for a parameter that cannot be read: use CheckParameters to tell.",
+			(a, rest) => GetParameters(rest));
+		Register("CheckParameters", "<parameter>[,<parameter>...]", "True | False,...", "True for each parameter that can be read.",
+			(a, rest) => CheckParameters(rest));
+		Register("ProbeInstrument", "", "OK", "Diagnostic: log the instrument object's properties and members to the Qtegra log, to look for a list of its parameters.",
+			(a, rest) => ProbeInstrument());
 	}
 
 	private static string ExecuteCommand (string cmd)
 	{
 		string[] args = cmd.Trim().Split (new char[]{' '}, StringSplitOptions.RemoveEmptyEntries);
-		CommandHandler handler;
-		if (args.Length == 0 || !COMMANDS.TryGetValue(args[0], out handler))
+		CommandInfo info;
+		if (args.Length == 0 || !COMMANDS.TryGetValue(args[0], out info))
 		{
 			return "Error: Invalid Command";
 		}
 		string rest = String.Join(" ", Slice(args, 1, 0));
-		if (QUICK_COMMANDS.Contains(args[0]))
+		if (info.Quick)
 		{
-			return handler(args, rest);
+			return info.Handler(args, rest);
 		}
 		lock(m_command_lock)
 		{
-			return handler(args, rest);
+			return info.Handler(args, rest);
 		}
 	}
 
@@ -612,14 +639,13 @@ class RemoteControl
 
         return string.Join(",",data.ToArray());
     }
-    public static string GetParameters(string[] args)
+    public static string GetParameters(string names)
     {
         List<string> data = new List<string>();
         double v;
-        //string param;
-        foreach(string k in args[1].Split(','))
+        foreach(string k in names.Split(','))
         {
-           if (!Instrument.GetParameter(k, out v))
+           if (!Instrument.GetParameter(k.Trim(), out v))
            {
                 v = 0;
            }
@@ -627,7 +653,29 @@ class RemoteControl
         }
 
         return string.Join(",",data.ToArray());
+    }
 
+    // True for each parameter Qtegra can read, False otherwise
+    public static string CheckParameters(string names)
+    {
+        List<string> data = new List<string>();
+        double v;
+        foreach(string k in names.Split(','))
+        {
+            data.Add(Instrument.GetParameter(k.Trim(), out v) ? "True" : "False");
+        }
+        return string.Join(",",data.ToArray());
+    }
+
+    // Diagnostic: log what the instrument object exposes, to look for a list of its hardware parameters
+    private static string ProbeInstrument()
+    {
+        log("==== ProbeInstrument start ====");
+        log(String.Format("Instrument type={0}, .NET={1}", Instrument.GetType().FullName, Environment.Version));
+        logproperties(Instrument, "Instrument");
+        listattributes(Instrument.GetType(), "Instrument");
+        log("==== ProbeInstrument end ====");
+        return "OK";
     }
 	public static string mActivateCup(string a, string b)
     {
